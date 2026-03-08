@@ -4,335 +4,189 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is **frida-rust**, official Rust bindings for [Frida](https://frida.re), a dynamic instrumentation toolkit. The project provides safe Rust wrappers around Frida's C APIs for runtime code injection, hooking, and tracing.
+本项目基于 frida-rust 仓库，扩展了一套自定义的 Android ARM64 动态插桩框架。核心组件：
+- **agent** — 注入到 Android 进程的 cdylib SO
+- **agent-host** — Windows 端 REPL 控制工具
+- **agent-protocol** — 共享的结构化通信协议
+- **quickjs-hook** — QuickJS + ARM64 inline hook 引擎 + Frida 风格 JS API
 
-## Workspace Structure
+上游 frida/frida-gum/frida-sys 等 crate 屚于原始 frida-rust 项目，本项目不依赖它们。
 
-The repository is a Cargo workspace with these crates:
+## Workspace 结构
 
-| Crate | Purpose |
-|-------|---------|
-| `frida` | High-level bindings for frida-core (device management, process injection, RPC scripts) |
-| `frida-sys` | Raw FFI bindings for frida-core (generated via bindgen) |
-| `frida-gum` | High-level bindings for Frida Gum (local instrumentation: interceptor, stalker, module APIs) |
-| `frida-gum-sys` | Raw FFI bindings for frida-gum (generated via bindgen) |
-| `frida-build` | Build helper for auto-downloading Frida devkits |
+```
+frida-rust/
+├─ examples/
+│  ├─ agent/              # Android SO (cdylib), JNI_OnLoad/init_array 入口
+│  │  ├─ src/lib.rs       # TCP 重连 + 命令分发
+│  │  └─ src/js.rs        # jsinit/loadjs/reloadjs 处理
+│  ├─ agent-host/         # Windows CLI REPL
+│  └─ agent-protocol/     # 共享协议 (frame + message)
+├─ quickjs-hook/           # 独立 crate (不在 workspace members 内, exclude)
+│  ├─ src/
+│  │  ├─ hook_engine.c    # ARM64 inline hook 引擎 (C)
+│  │  ├─ arm64_writer.c   # ARM64 指令生成器
+│  │  ├─ arm64_relocator.c# ARM64 指令重定位
+│  │  ├─ lib.rs           # Rust 包装: JSEngine, init_hook_engine
+│  │  ├─ ffi.rs           # bindgen 生成的 FFI 绑定
+│  │  ├─ runtime.rs       # QuickJS Runtime 包装
+│  │  ├─ context.rs       # QuickJS Context 包装
+│  │  ├─ value.rs         # QuickJS JSValue 包装
+│  │  └─ jsapi/           # Frida 风格 JS API
+│  │     ├─ mod.rs        # register_all_apis()
+│  │     ├─ interceptor.rs# Interceptor.attach/detachAll
+│  │     ├─ module_api.rs # Module.findExportByName/getBaseAddress
+│  │     ├─ process.rs    # Process.enumerateModules/id/arch
+│  │     ├─ memory.rs     # Memory.readU8/writeU8/readCString/...
+│  │     ├─ hook_api.rs   # hook()/unhook() 低级 API
+│  │     ├─ ptr.rs        # NativePointer / ptr() 构造
+│  │     ├─ send.rs       # send() 消息缓冲
+│  │     └─ console.rs    # console.log/warn/error
+│  └─ quickjs-src/         # QuickJS C 源码
+├─ justfile                 # Android 交叉编译命令
+└─ .cargo/config.toml       # NDK linker 配置
+```
 
 ## Build Commands
 
 ```bash
-# Build all default workspace members
-cargo build
+# Android agent SO (release)
+just agent
 
-# Build with auto-download feature (downloads Frida devkits automatically)
-cargo build --features auto-download
+# Windows agent-host (release)
+just host
 
-# Build frida-gum with JavaScript scripting support
-cargo build --features frida-gum/script
+# 推送 SO 到设备
+just push
 
-# Build for Android (requires NDK toolchain)
-cargo build --target aarch64-linux-android
+# adb 端口转发
+just forward
+
+# 运行 agent-host REPL
+just run
+
+# Windows 本地测试
+cargo test -p agent-protocol
+cargo test -p agent
 ```
 
-### Prerequisites
+### 交叉编译依赖
+- Android NDK 27 (path: `%LOCALAPPDATA%\Android\Sdk\ndk\27.0.12077973`)
+- LLVM for Windows (`C:\Program Files\LLVM\bin\libclang.dll`, bindgen 需要)
+- Rust target: `rustup target add aarch64-linux-android`
+- justfile 已配置所有 CC/AR/LINKER/BINDGEN 环境变量
 
-Without `auto-download` feature, you must manually place Frida devkits:
-- `frida-gum.h` and `libfrida-gum.a` → `/usr/local/include` and `/usr/local/lib`
-- `frida-core.h` and `libfrida-core.a` → same locations
+## 通信协议
 
-## Running Examples
-
-Examples are split into two categories:
-
-```bash
-# Core examples (frida-core: device management, injection)
-cargo run -p hello           # Basic Frida initialization
-cargo run -p usb-device      # USB device enumeration
-cargo run -p get-processes   # List processes on device
-cargo run -p inject-lib-file # Inject library into process
-
-# Gum examples (local instrumentation)
-cargo run -p hook-open       # Function hooking (builds cdylib, inject with LD_PRELOAD)
-cargo run -p process-check   # Process enumeration
-cargo run -p stalker         # Code tracing with Stalker
-cargo run -p debug-symbol    # Symbol resolution
-
-# Agent examples (custom instrumentation framework)
-# Agent SO - minimal Android SO with Unix socket communication
-cargo build -p agent --target aarch64-linux-android --release
-# Output: target/aarch64-linux-android/release/libagent.so
-
-# Agent Host - Unix socket host tool (Linux/macOS only)
-cargo run -p agent-host      # Interactive command shell for agent
+```
+agent-host (Windows)  ←─ TCP :12708 ─→  libagent.so (Android)
+         │                                    │
+    REPL/CLI                            JNI_OnLoad 启动
+    发送 Request                       自动重连 TCP
+    显示 Response                     分发命令并响应
 ```
 
-## Key Architecture Concepts
+- 帧格式: 4字节 LE 长度 + JSON payload
+- 握手: agent 连接后发送 Hello (pid, version, capabilities)
+- 消息: Request {id, command, args} / Response {id, status, data, error_code, error_message}
 
-### Two API Surfaces
+## JS API 参考
 
-1. **frida crate (frida-core)**: Remote instrumentation
-   - `DeviceManager` → `Device` → `Session` → `Script`
-   - Used for attaching to remote processes, injecting code, RPC communication
-   - Requires Frida server running on target
+```javascript
+// 初始化 (REPL 中执行)
+jsinit
+loadjs test.js      // 读取文件并执行
+loadjs send("hi")   // 内联 JS
+reloadjs test.js    // 热加载: 清理所有 hook → 重建引擎 → 执行
 
-2. **frida-gum crate**: Local in-process instrumentation
-   - `Gum` singleton for initialization
-   - `Interceptor` for function hooking (replace/attach)
-   - `Stalker` for code tracing (follow/unfollow threads)
-   - `Module` for symbol resolution and memory operations
-   - `instruction_writer` for JIT code generation
+// Process
+Process.id           // pid
+Process.arch         // "arm64"
+Process.enumerateModules()  // [{name, base, size, path}]
 
-### Gum Feature Flags
+// Module
+Module.findExportByName("libc.so", "open")  // NativePointer
+Module.getBaseAddress("libc.so")            // NativePointer
 
-| Feature | Purpose |
-|---------|---------|
-| `script` | JavaScript scripting via GumJS |
-| `event-sink` | Stalker event callbacks |
-| `invocation-listener` | Interceptor invocation callbacks |
-| `stalker-observer` | Stalker block observation |
-| `stalker-params` | Custom Stalker parameters |
-| `backtrace` | Backtrace support |
-| `memory-access-monitor` | Memory watchpoints |
-| `std` | Standard library support (default for most targets) |
-
-### no_std Support
-
-`frida-gum` supports `no_std` environments (useful for embedded/firmware):
-- Disable `std` feature
-- Requires `alloc` crate
-- See `examples/gum/linux_no_std/` for reference
-
-## Development Patterns
-
-### Gum Initialization
-
-```rust
-use frida_gum::Gum;
-// Singleton pattern - Gum::obtain() can be called multiple times
-let gum = Gum::obtain();
-```
-
-### Function Hooking Pattern
-
-```rust
-use frida_gum::{interceptor::Interceptor, Gum, Module, NativePointer};
-
-let gum = Gum::obtain();
-let module = Module::load(&gum, "libc.so.6");
-let mut interceptor = Interceptor::obtain(&gum);
-let func_ptr = module.find_export_by_name("target_func").unwrap();
-
-// Replace function
-interceptor.replace(func_ptr, NativePointer(detour_fn as *mut c_void), NativePointer(std::ptr::null_mut())).unwrap();
-```
-
-### Stalker Tracing Pattern
-
-```rust
-use frida_gum::stalker::{Stalker, Transformer};
-
-let mut stalker = Stalker::new(&gum);
-let transformer = Transformer::from_callback(&gum, |block, output| {
-    for instr in block {
-        instr.keep();  // Pass through instruction
-    }
+// Interceptor (ARM64 inline hook)
+Interceptor.attach(addr, {
+    onEnter: function(args) { /* args[0]~args[7] = x0~x7 */ },
+    onLeave: function(retval) { /* retval = x0 */ }
 });
-stalker.follow_me(&transformer);
-// ... code to trace ...
-stalker.unfollow_me();
+Interceptor.detachAll();
+
+// 低级 hook API
+hook(addr, callback, stealth?)   // stealth=true 用 wxshadow
+unhook(addr)
+
+// Memory
+Memory.readU8/readU16/readU32/readU64(ptr)
+Memory.readPointer(ptr)
+Memory.readCString(ptr) / Memory.readUtf8String(ptr)
+Memory.readByteArray(ptr, len)
+Memory.writeU8/writeU16/writeU32/writeU64(ptr, val)
+
+// 消息
+send(message)        // 缓冲到 Vec, loadjs 完成后返回
+console.log/warn/error
+ptr("0x12345678")   // 构造 NativePointer
 ```
 
-## Learning Resources
+## Hook 引擎工作原理
 
-The file `rustfrida-7day-tutorial.md` contains a detailed tutorial for building a custom Frida-like tool, covering:
-- Direct syscalls (bypassing libc hooks)
-- ARM64 instruction relocation
-- Hardware breakpoint hooking via KPM kernel modules
-- ART Java method hooking
-- Code tracing with Stalker
+hook_engine.c 实现 ARM64 inline hook:
 
-## Agent Module (Custom Instrumentation Framework)
+1. **mmap 1MB RWX 内存池** — jsinit 时自动分配
+2. **hook_attach** — 搜集目标函数头部 20字节(5条指令)，relocate 到 trampoline
+3. **生成 thunk** — 保存寄存器 → on_enter → trampoline(原函数) → on_leave → 恢复寄存器
+4. **patch 目标入口** — MOVZ/MOVK + BR 跳到 thunk
+5. 两种模式: normal (mprotect RWX) / stealth (prctl wxshadow, 小米内核特有)
 
-The `agent` and `agent-host` examples implement a minimal custom instrumentation framework for learning purposes, as described in `rustfrida-7day-tutorial.md` Day 1.
+## 已知缺陷
 
-### Architecture
+### P0 - 功能缺陷
+1. **Interceptor.attach 未验证** — hook_engine_init 刚加上，Interceptor.attach 在设备上还未成功运行过，可能存在 mprotect 失败等问题
+2. **hook_attach 错误信息丢失** — interceptor.rs 只抛 "Interceptor.attach failed"，不报告具体错误码 (HOOK_ERROR_MPROTECT_FAILED 等)
+3. **目标页 mprotect 后未恢复** — hook_attach normal 模式 patch 完目标后，页保持 RWX，应恢复为 R-X
+4. **Process.enumerateModules() 返回非 SO 条目** — 解析 /proc/self/maps 会包含 .oat/.vdex/.art 等，与 Frida 行为不一致
 
-```
-┌─────────────────┐                    ┌─────────────────────┐
-│   agent-host    │                    │   libagent.so       │
-│   (PC/Linux)    │◄── Unix Socket ───►│   (Android ARM64)   │
-│                 │   (abstract)       │                     │
-│   Commands:     │                    │   Commands:         │
-│   - ping        │                    │   - hello_entry()   │
-│   - echo        │                    │   - constructor     │
-│   - exit        │                    │                     │
-└─────────────────┘                    └─────────────────────┘
-```
+### P1 - 安全/隐蔽缺陷
+5. **1MB RWX 内存池可检测** — /proc/self/maps 里有 rwxp 匿名段，易被安全检测发现
+6. **stealth 模式未暴露给 JS** — Interceptor.attach 写死 stealth=0，应支持可选 options
+7. **Memory.write* 无权限检查** — 直接解引用写入，无效地址会崩溃
 
-### Usage on Android
+### P2 - 工程缺陷
+8. **agent 命令大量 stub** — list_modules/list_threads/find_symbol/read_memory/trace_start/trace_stop 均返回 NotImplemented
+9. **无 Interceptor.detach(单个)** — 只有 detachAll，缺少按 handle 卸载单个 hook
+10. **quickjs-hook 无测试** — JS API 层没有任何单元测试
+11. **agent/.cargo/config.toml linker 配置冲突** — 使用裸命令名，与根目录 .cargo/config.toml 和 justfile 重复配置
+12. **2个编译警告未修复** — ptr.rs unused doc comment, process.rs unused variable
 
-1. **Build the agent SO:**
-   ```bash
-   # Requires Android NDK and target: aarch64-linux-android
-   cargo build -p agent --target aarch64-linux-android --release
-   ```
+## 开发路线图
 
-2. **Push to device and inject:**
-   ```bash
-   adb push libagent.so /data/local/tmp/
-   # Use Zygisk, frida-inject, or other injection methods
-   ```
+### Phase 1 - 控制面稳定化 ✅ 完成
+- 结构化 Request/Response 协议
+- Hello 握手 + 能力声明
+- TCP 自动重连 + logcat 日志
 
-3. **Communicate from Windows:**
-   - Use ADB port forwarding (requires TCP version or socat)
-   - Or run `agent-host` in WSL
+### Phase 3 (部分) - 用户空间能力 ✅ 部分完成
+- QuickJS 集成 + Frida 风格 JS API
+- ARM64 inline hook 引擎 (hook_engine.c)
+- 热加载 (reloadjs)
+- 已实现: Interceptor, Module, Process, Memory, send, NativePointer, console, hook/unhook
 
-### Abstract Unix Socket
+### 下一步实现顺序
+1. **验证 Interceptor.attach 可用** — 在设备上测试 hook open() 并确认回调触发
+2. **修复 P0 缺陷** — 错误码透传、mprotect 恢复、maps 过滤
+3. **实现剩余 agent 命令** — list_modules 可复用 Process.enumerateModules，find_symbol 复用 Module.findExportByName，read_memory 复用 Memory API
+4. **暴露 stealth 选项** — Interceptor.attach(addr, callbacks, {stealth: true})
+5. **Phase 2** — 拆分 host 为 core/CLI/MCP
+6. **Phase 4** — KPM 集成
 
-The agent uses abstract Unix socket namespace (`\0my_agent_socket`):
-- No file system entry (more stealthy)
-- Linux-specific feature
-- Not accessible across namespace boundaries
+## 编码约定
 
-## Related Projects
-
-- `C:\Users\24151\Documents\GitHub\rustFrida` - Reference implementation being studied
-- `C:\Users\24151\Documents\GitHub\xiaojia-hide` - KPM kernel module for stealth hooks
-- `C:\Users\24151\Documents\GitHub\zygisk_gadget` - Zygisk injection tool for Android
-
-## Development Roadmap: TCP Agent -> MCP -> KPM
-
-### Current Status
-
-- Windows <-> Android TCP transport is working.
-- `libagent.so` can be loaded by the Android app and automatically reconnect to the PC host.
-- The next priority is **not** KPM transport yet; it is to stabilize the **user-space control plane**, protocol, and command model first.
-
-### Phase 1 - Stabilize the Control Plane
-
-**Goal:** Turn the current demo transport into a stable control channel that can be automated and extended.
-
-**Tasks:**
-- Keep the existing length-prefixed frame transport as the wire format foundation.
-- Upgrade ad-hoc string commands into structured request/response messages.
-- Add `request_id`, `command`, `args`, `status`, `error_code`, `error_message` fields.
-- Add `hello`, `version`, `capabilities`, and `heartbeat` style messages.
-- Standardize reconnect, timeout, session close, and error handling behavior.
-- Keep Android `logcat` messages for load, connect success, connect failure, and reconnect attempts.
-
-**Recommended first commands:**
-- `ping`
-- `get_info`
-- `list_modules`
-- `list_threads`
-- `trace_start`
-- `trace_stop`
-- `jsinit`
-- `loadjs`
-
-**Exit Criteria:**
-- Host and agent can exchange structured messages reliably.
-- A command failure is machine-readable instead of relying on human-readable text.
-- The transport layer no longer needs to change when new commands are added.
-
-### Phase 2 - Split Host Into Core / CLI / MCP
-
-**Goal:** Make the PC side usable by both humans and AI systems without mixing protocols.
-
-**Architecture:**
-- `agent-host-core`: TCP session management, framing, request/response API.
-- `agent-host` CLI: human-facing REPL and one-shot command mode.
-- `agent-host` MCP mode: machine-facing stdio server for IDE/agent/runtime integration.
-
-**Tasks:**
-- Keep a human REPL mode for debugging and manual operation.
-- Add a one-shot mode such as `exec --json` for scripts and CI.
-- Add an MCP stdio mode where `stdout` is reserved for protocol messages only.
-- Send logs and diagnostics to `stderr` in MCP mode.
-- Map agent commands to MCP tools instead of asking the model to parse console text.
-
-**Exit Criteria:**
-- A human can use the tool from a console.
-- An MCP client can use the same capabilities through structured stdio messages.
-- The CLI output format can evolve independently from the MCP protocol.
-
-### Phase 3 - Implement Real User-Space Agent Capabilities
-
-**Goal:** Move from transport demo to a usable instrumentation agent.
-
-**Tasks:**
-- Initialize Frida Gum inside the Android agent.
-- Implement module enumeration and symbol lookup.
-- Implement thread enumeration and process metadata queries.
-- Implement memory read primitives first, then carefully add write primitives.
-- Implement `trace_start` / `trace_stop` on top of Gum Stalker.
-- Implement `jsinit` / `loadjs` on top of a managed scripting runtime.
-- Add capability detection so unsupported features are reported cleanly.
-
-**Recommended command growth order:**
-1. `get_info`
-2. `list_modules`
-3. `find_symbol`
-4. `list_threads`
-5. `read_memory`
-6. `trace_start`
-7. `trace_stop`
-8. `jsinit`
-9. `loadjs`
-
-**Exit Criteria:**
-- The agent is useful even without kernel support.
-- Core workflows such as process introspection, module lookup, tracing, and script loading work from the PC side.
-
-### Phase 4 - Integrate KPM as an Optional Backend
-
-**Goal:** Add kernel-assisted capabilities without destabilizing the user-space control plane.
-
-**Key Principle:**
-- KPM should be treated as an **internal backend**, not as a replacement for the existing PC <-> agent protocol.
-- The external control protocol should remain stable while the backend grows more powerful.
-
-**Tasks:**
-- Define a clear agent <-> KPM communication layer.
-- Add capability probing: user-space only vs user-space + KPM.
-- Route only kernel-dependent commands through KPM.
-- Keep graceful fallback when KPM is absent, incompatible, or unavailable.
-- Expose backend state through `get_info` / `capabilities`.
-
-**Good KPM candidates:**
-- Hardware-breakpoint-assisted hooks
-- Stealth-oriented features
-- Kernel-backed memory or breakpoint helpers
-- Detection-resistant tracing support
-
-**Exit Criteria:**
-- KPM-enhanced features can be enabled without changing the PC-side protocol.
-- The system still works in degraded user-space mode when KPM is unavailable.
-
-### Phase 5 - Operational Hardening
-
-**Goal:** Make the tool reliable enough for longer sessions and automation.
-
-**Tasks:**
-- Add protocol versioning.
-- Add session authentication or handshake tokens if needed.
-- Add detailed error taxonomy and timeouts.
-- Add connection health checks and reconnect state reporting.
-- Add command logging levels for debug / info / error.
-- Add basic test coverage for framing, command dispatch, and session state.
-
-### Recommended Immediate Next Step
-
-The recommended next implementation order is:
-
-1. Keep TCP as-is and freeze the framing layer.
-2. Replace plain text commands with structured request/response messages.
-3. Split the host into reusable core logic plus CLI and MCP modes.
-4. Implement real user-space commands (`get_info`, `list_modules`, `list_threads`, `trace_start`, `trace_stop`, `jsinit`, `loadjs`).
-5. Integrate KPM only after the above protocol and command surface are stable.
-
-### Non-Goals For The Next Step
-
-- Do **not** redesign the transport again before the command protocol is stabilized.
-- Do **not** make AI parse human REPL output as if it were an API.
-- Do **not** move KPM ahead of protocol and capability design.
+- 注释用中文
+- quickjs-hook 是独立 crate (Cargo.toml exclude)，agent 通过 `cfg(target_os = "android")` 条件依赖它
+- 非 Android 平台的 JS 命令返回 NotImplemented (stub)
+- hook_engine.c / arm64_writer.c / arm64_relocator.c 是纯 C 代码，通过 build.rs (cc + bindgen) 编译
+- bindgen 交叉编译时需要 -isystem 显式指定 NDK sysroot include 路径 (Windows libclang 不支持 --sysroot)
