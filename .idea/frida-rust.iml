@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/examples/core/console_log/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/core/get_processes/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/core/hello/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/core/inject_lib_blob/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/core/inject_lib_file/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/core/list_exports/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/core/rpc_execute_function/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/core/usb_device/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/debug_symbol/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/fast_interceptor/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/hook_instruction/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/hook_open/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/linux_no_std/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/memory_access_monitor/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/open/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/process_check/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/script/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/stalker/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/gum/stalker_observer/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/frida-build/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/frida-gum-sys/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/frida-gum/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/frida-sys/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/frida/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/agent-host/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/agent/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

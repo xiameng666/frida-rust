@@ -1,0 +1,14 @@
+# Android cross-compilation configuration
+# Set ANDROID_NDK_HOME environment variable to your NDK path
+
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android31-clang"
+
+[target.armv7-linux-androideabi]
+linker = "armv7a-linux-androideabi31-clang"
+
+[target.i686-linux-android]
+linker = "i686-linux-android31-clang"
+
+[target.x86_64-linux-android]
+linker = "x86_64-linux-android31-clang"
