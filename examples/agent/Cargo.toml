@@ -11,3 +11,7 @@ crate-type = ["cdylib"]
 [features]
 default = ["tcp"]
 tcp = []
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+serde_json = "1"

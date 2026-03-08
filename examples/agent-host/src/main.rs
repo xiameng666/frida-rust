@@ -4,18 +4,30 @@
 //! `adb reverse tcp:12708 tcp:12708`
 
 use std::env;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use agent_protocol::{
+    frame, Hello, HostMode, Request, Response, Status,
+};
+use serde_json::json;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 12708;
-const MAX_FRAME_LEN: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 全局请求 ID 计数器。
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id() -> String {
+    REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
+#[derive(Debug, Clone)]
 struct Config {
     host: String,
     port: u16,
-    once: Option<String>,
+    mode: HostMode,
 }
 
 fn main() {
@@ -47,8 +59,19 @@ fn main() {
 }
 
 fn run(config: Config) -> io::Result<()> {
-    println!("[*] Agent Host Tool v0.1.0");
-    println!("[*] Mode: TCP");
+    // MCP 模式预留，暂不实现
+    if config.mode == HostMode::Mcp {
+        eprintln!("[!] MCP mode is reserved but not yet implemented.");
+        eprintln!("[!] Use --mode cli (default) for now.");
+        std::process::exit(1);
+    }
+
+    println!("[*] Agent Host Tool v0.2.0 (structured protocol)");
+    println!("[*] Mode: {}", match &config.mode {
+        HostMode::Cli => "CLI (interactive REPL)",
+        HostMode::Once(_) => "one-shot",
+        HostMode::Mcp => unreachable!(),
+    });
     println!("[*] Listening on {}:{}", config.host, config.port);
     println!(
         "[*] For USB debugging, run: adb reverse tcp:{0} tcp:{0}",
@@ -61,19 +84,33 @@ fn run(config: Config) -> io::Result<()> {
 
     println!("[+] Agent connected from {addr}");
 
-    let greeting = read_response(&mut stream)?;
-    println!("[<] {greeting}");
+    // 读取 Hello 握手
+    let hello: Hello = frame::read_message(&mut stream)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "agent disconnected before hello")
+    })?;
 
-    if let Some(command) = config.once.as_deref() {
-        let keep_running = send_command(&mut stream, command)?;
-        if !keep_running {
-            println!("[*] Session closed by command");
+    println!("[+] Agent hello: pid={}, version={}, transport={}", hello.pid, hello.version, hello.transport);
+    println!("[+] Capabilities: {:?}", hello.capabilities.commands);
+
+    match config.mode {
+        HostMode::Once(ref command) => {
+            let keep_running = send_command(&mut stream, command)?;
+            if !keep_running {
+                println!("[*] Session closed by command");
+            }
         }
-        return Ok(());
+        HostMode::Cli => {
+            print_repl_help();
+            repl_loop(&mut stream)?;
+        }
+        HostMode::Mcp => unreachable!(),
     }
 
-    print_repl_help();
+    Ok(())
+}
 
+/// 交互式 REPL 循环。
+fn repl_loop(stream: &mut TcpStream) -> io::Result<()> {
     let stdin = io::stdin();
     loop {
         print!("agent> ");
@@ -85,87 +122,121 @@ fn run(config: Config) -> io::Result<()> {
             return Ok(());
         }
 
-        let command = input.trim();
-        if command.is_empty() {
+        let input = input.trim();
+        if input.is_empty() {
             continue;
         }
 
-        if command == "help" {
+        // 本地 help 直接显示
+        if input == "help" {
             print_repl_help();
             continue;
         }
 
-        if !send_command(&mut stream, command)? {
+        if !send_command(stream, input)? {
             return Ok(());
         }
     }
 }
 
-fn send_command(stream: &mut TcpStream, command: &str) -> io::Result<bool> {
-    let wire_command = if command.eq_ignore_ascii_case("quit") {
-        "exit"
-    } else {
-        command
-    };
+/// 解析用户输入为结构化请求，发送并显示响应。
+/// 返回 false 表示会话应结束。
+fn send_command(stream: &mut TcpStream, input: &str) -> io::Result<bool> {
+    let req = parse_user_input(input);
+    let is_exit = req.command == "exit";
 
-    write_frame(stream, wire_command.as_bytes())?;
+    frame::write_message(stream, &req)?;
 
-    let response = read_response(stream)?;
-    println!("[<] {response}");
-
-    Ok(!wire_command.eq_ignore_ascii_case("exit"))
-}
-
-fn read_response(stream: &mut TcpStream) -> io::Result<String> {
-    match read_frame(stream)? {
-        Some(frame) => Ok(String::from_utf8_lossy(&frame).into_owned()),
-        None => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "agent disconnected",
-        )),
-    }
-}
-
-fn write_frame<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
-where
-    W: Write,
-{
-    let len = u32::try_from(payload.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "frame payload is larger than u32::MAX",
-        )
+    let resp: Response = frame::read_message(stream)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "agent disconnected")
     })?;
 
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(payload)?;
-    writer.flush()?;
-    Ok(())
+    display_response(&resp);
+
+    Ok(!is_exit)
 }
 
-fn read_frame<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
-where
-    R: Read,
-{
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
+/// 将用户 REPL 输入转换为结构化 Request。
+/// 支持简写: "echo hello" -> {command:"echo", args:{"text":"hello"}}
+fn parse_user_input(input: &str) -> Request {
+    let id = next_request_id();
+    let (verb, rest) = split_first_word(input);
 
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame too large: {len} bytes"),
-        ));
-    }
+    // quit 映射到 exit
+    let verb = if verb == "quit" { "exit" } else { verb };
 
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
-    Ok(Some(payload))
+    match verb {
+        "echo" if !rest.is_empty() => {
+            Request::with_args(id, verb, json!({ "text": rest }))
+        }
+        "loadjs" if !rest.is_empty() => {
+            Request::with_args(id, verb, json!({ "script": rest }))
+        }
+        "find_symbol" if !rest.is_empty() => {
+            Request::with_args(id, verb, json!({ "name": rest }))
+        }
+        "read_memory" if !rest.is_empty() => {
+            // 简单格式: read_memory <address> [size]
+            let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+            let mut args = json!({ "address": parts[0] });
+            if let Some(size) = parts.get(1) {
+                args["size"] = json!(size.trim());
+            }
+            Request::with_args(id, verb, args)
+        }
+        _ => {
+            if rest.is_empty() {
+                Request::new(id, verb)
+            } else {
+                // 通用: 剩余部分作为 "args" 字符串
+                Request::with_args(id, verb, json!({ "raw": rest }))
+            }
+        }
+    }
 }
+
+/// 以人类友好的方式显示响应。
+fn display_response(resp: &Response) {
+    match resp.status {
+        Status::Ok => {
+            if let Some(ref data) = resp.data {
+                // 紧凑显示小对象，美化显示大对象
+                let json_str = serde_json::to_string(data).unwrap_or_default();
+                if json_str.len() < 120 {
+                    println!("[ok] {json_str}");
+                } else {
+                    let pretty = serde_json::to_string_pretty(data).unwrap_or(json_str);
+                    println!("[ok]\n{pretty}");
+                }
+            } else {
+                println!("[ok]");
+            }
+        }
+        Status::Error => {
+            let code = resp
+                .error_code
+                .as_ref()
+                .map(|c| format!("{c:?}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let msg = resp
+                .error_message
+                .as_deref()
+                .unwrap_or("no details");
+            println!("[err] [{code}] {msg}");
+        }
+    }
+}
+
+fn split_first_word(s: &str) -> (&str, &str) {
+    match s.find(char::is_whitespace) {
+        Some(i) => (&s[..i], s[i..].trim_start()),
+        None => (s, ""),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 参数解析
+// ---------------------------------------------------------------------------
 
 fn parse_args<I>(args: I) -> Result<Config, String>
 where
@@ -179,7 +250,7 @@ where
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_PORT);
-    let mut once = None;
+    let mut mode = HostMode::Cli;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -191,12 +262,22 @@ where
                     .parse()
                     .map_err(|_| format!("invalid port: {value}"))?;
             }
-            "--once" => once = Some(take_value("--once", &mut iter)?),
+            "--once" => {
+                mode = HostMode::Once(take_value("--once", &mut iter)?);
+            }
+            "--mode" => {
+                let value = take_value("--mode", &mut iter)?;
+                mode = match value.as_str() {
+                    "cli" => HostMode::Cli,
+                    "mcp" => HostMode::Mcp,
+                    _ => return Err(format!("unknown mode: {value} (supported: cli, mcp)")),
+                };
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
 
-    Ok(Config { host, port, once })
+    Ok(Config { host, port, mode })
 }
 
 fn take_value<I>(flag: &str, iter: &mut I) -> Result<String, String>
@@ -208,36 +289,54 @@ where
 }
 
 fn print_repl_help() {
-    println!(
-        "[*] Commands: ping, pid, echo <text>, hello_entry, trace <arg>, jhook, jsinit, loadjs <script>, quit"
-    );
+    println!("[*] Commands:");
+    println!("    ping              - 检查 agent 连通性");
+    println!("    get_info          - 获取 agent 信息");
+    println!("    echo <text>       - 回显文本");
+    println!("    list_modules      - 枚举模块 (stub)");
+    println!("    list_threads      - 枚举线程 (stub)");
+    println!("    find_symbol <name> - 查找符号 (stub)");
+    println!("    read_memory <addr> [size] - 读取内存 (stub)");
+    println!("    trace_start       - 开始跟踪 (stub)");
+    println!("    trace_stop        - 停止跟踪 (stub)");
+    println!("    jsinit            - 初始化 JS 引擎 (stub)");
+    println!("    loadjs <script>   - 加载 JS 脚本 (stub)");
+    println!("    help              - 显示此帮助");
+    println!("    quit / exit       - 断开连接");
 }
 
 fn print_usage(program: &str) {
-    println!("Usage: {program} [--host HOST] [--port PORT] [--once COMMAND]");
+    println!("Usage: {program} [OPTIONS]");
+    println!();
+    println!("Options:");
+    println!("    --host HOST       Listen address (default: {DEFAULT_HOST})");
+    println!("    --port PORT       Listen port (default: {DEFAULT_PORT})");
+    println!("    --once COMMAND    Send one command and exit");
+    println!("    --mode cli|mcp    Run mode (default: cli; mcp is reserved)");
     println!();
     println!("Examples:");
     println!("  adb reverse tcp:{0} tcp:{0}", DEFAULT_PORT);
     println!("  cargo run -p agent-host");
     println!("  cargo run -p agent-host -- --once ping");
+    println!("  cargo run -p agent-host -- --mode mcp  # reserved, not yet implemented");
 }
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, read_frame, write_frame, Config, DEFAULT_HOST, DEFAULT_PORT};
+    use super::*;
+    use agent_protocol::frame;
     use std::io::Cursor;
 
     #[test]
     fn parse_defaults() {
         let config = parse_args(Vec::<String>::new()).unwrap();
-        assert_eq!(
-            config,
-            Config {
-                host: DEFAULT_HOST.to_string(),
-                port: DEFAULT_PORT,
-                once: None,
-            }
-        );
+        assert_eq!(config.host, DEFAULT_HOST);
+        assert_eq!(config.port, DEFAULT_PORT);
+        assert_eq!(config.mode, HostMode::Cli);
     }
 
     #[test]
@@ -252,23 +351,44 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(
-            config,
-            Config {
-                host: "0.0.0.0".to_string(),
-                port: 31337,
-                once: Some("ping".to_string()),
-            }
-        );
+        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.port, 31337);
+        assert!(matches!(config.mode, HostMode::Once(ref cmd) if cmd == "ping"));
+    }
+
+    #[test]
+    fn parse_mode_mcp() {
+        let config = parse_args(vec!["--mode".to_string(), "mcp".to_string()]).unwrap();
+        assert_eq!(config.mode, HostMode::Mcp);
+    }
+
+    #[test]
+    fn parse_user_input_simple() {
+        let req = parse_user_input("ping");
+        assert_eq!(req.command, "ping");
+        assert_eq!(req.args, json!({}));
+    }
+
+    #[test]
+    fn parse_user_input_echo() {
+        let req = parse_user_input("echo hello world");
+        assert_eq!(req.command, "echo");
+        assert_eq!(req.args["text"], "hello world");
+    }
+
+    #[test]
+    fn parse_user_input_quit_maps_to_exit() {
+        let req = parse_user_input("quit");
+        assert_eq!(req.command, "exit");
     }
 
     #[test]
     fn frame_roundtrip() {
-        let mut buffer = Vec::new();
-        write_frame(&mut buffer, b"ping").unwrap();
+        let mut buf = Vec::new();
+        frame::write_frame(&mut buf, b"ping").unwrap();
 
-        let mut cursor = Cursor::new(buffer);
-        let payload = read_frame(&mut cursor).unwrap().unwrap();
+        let mut cursor = Cursor::new(buf);
+        let payload = frame::read_frame(&mut cursor).unwrap().unwrap();
         assert_eq!(payload, b"ping");
     }
 }

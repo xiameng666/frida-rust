@@ -4,13 +4,17 @@
 //! 1. Run `adb reverse tcp:12708 tcp:12708`
 //! 2. Start `cargo run -p agent-host`
 //! 3. Inject `libagent.so` into the target Android process
-//! 4. The agent connects back to `127.0.0.1:12708` and enters a framed command loop
+//! 4. The agent connects back to `127.0.0.1:12708` and enters a structured command loop
 
 #![cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 
 #[cfg(target_os = "android")]
 use std::env;
-use std::io::{self, Read, Write};
+
+use agent_protocol::{
+    Command, ErrorCode, Request, Response, PROTOCOL_VERSION,
+};
+use serde_json::json;
 
 #[cfg(target_os = "android")]
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -20,7 +24,10 @@ const DEFAULT_PORT: u16 = 12708;
 const DEFAULT_RECONNECT_MS: u64 = 1_000;
 #[cfg(target_os = "android")]
 const JNI_VERSION_1_6: i32 = 0x0001_0006;
-const MAX_FRAME_LEN: usize = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// 环境变量读取 (仅 Android)
+// ---------------------------------------------------------------------------
 
 #[cfg(target_os = "android")]
 fn read_env_string(keys: &[&str]) -> Option<String> {
@@ -68,94 +75,110 @@ fn reconnect_delay_ms() -> u64 {
     .unwrap_or(DEFAULT_RECONNECT_MS)
 }
 
-fn trim_line(line: &str) -> &str {
-    line.trim_end_matches(|ch| ch == '\r' || ch == '\n')
-}
+// ---------------------------------------------------------------------------
+// 结构化命令分发
+// ---------------------------------------------------------------------------
 
-fn split_command(command: &str) -> (&str, &str) {
-    match command.find(char::is_whitespace) {
-        Some(index) => (&command[..index], command[index..].trim_start()),
-        None => (command, ""),
-    }
-}
+/// 处理一个结构化请求，返回结构化响应。
+fn dispatch(req: &Request) -> Response {
+    let cmd = req.parsed_command();
 
-fn should_close(command: &str) -> bool {
-    matches!(split_command(trim_line(command)).0, "quit" | "exit")
-}
+    match cmd {
+        Command::Ping => Response::ok(&req.id, json!({ "pid": std::process::id() })),
 
-fn execute_command(command: &str) -> String {
-    let command = trim_line(command).trim();
-    let (verb, rest) = split_command(command);
+        Command::GetInfo => Response::ok(
+            &req.id,
+            json!({
+                "pid": std::process::id(),
+                "protocol_version": PROTOCOL_VERSION,
+                "transport": "tcp",
+            }),
+        ),
 
-    match verb {
-        "" => "ERR empty command".to_string(),
-        "help" => {
-            "OK commands: help, ping, pid, echo <text>, hello_entry, trace <arg>, jhook, jsinit, loadjs <script>, quit".to_string()
+        Command::Echo => {
+            let text = req.args.get("text").and_then(|v| v.as_str());
+            match text {
+                Some(t) => Response::ok(&req.id, json!({ "text": t })),
+                None => Response::error(
+                    &req.id,
+                    ErrorCode::InvalidArgs,
+                    "echo requires 'text' argument",
+                ),
+            }
         }
-        "ping" => format!("PONG pid={}", std::process::id()),
-        "pid" => format!("OK pid={}", std::process::id()),
-        "echo" if rest.is_empty() => "ERR echo requires text".to_string(),
-        "echo" => rest.to_string(),
-        "hello_entry" => "OK hello_entry stub".to_string(),
-        "trace" if rest.is_empty() => "OK trace stub".to_string(),
-        "trace" => format!("OK trace stub: {rest}"),
-        "jhook" if rest.is_empty() => "OK jhook stub".to_string(),
-        "jhook" => format!("OK jhook stub: {rest}"),
-        "jsinit" => "OK jsinit stub".to_string(),
-        "loadjs" if rest.is_empty() => "ERR loadjs requires script".to_string(),
-        "loadjs" => format!("OK loadjs stub: {rest}"),
-        "quit" | "exit" => "BYE".to_string(),
-        _ => format!("ERR unknown command: {command}"),
+
+        Command::Help => Response::ok(
+            &req.id,
+            json!({ "commands": Command::supported_commands() }),
+        ),
+
+        Command::Exit => Response::ok_empty(&req.id),
+
+        // 以下命令为 stub，Phase 3 实现真实功能
+        Command::ListModules => Response::error(
+            &req.id,
+            ErrorCode::NotImplemented,
+            "list_modules not yet implemented",
+        ),
+        Command::ListThreads => Response::error(
+            &req.id,
+            ErrorCode::NotImplemented,
+            "list_threads not yet implemented",
+        ),
+        Command::FindSymbol => Response::error(
+            &req.id,
+            ErrorCode::NotImplemented,
+            "find_symbol not yet implemented",
+        ),
+        Command::ReadMemory => Response::error(
+            &req.id,
+            ErrorCode::NotImplemented,
+            "read_memory not yet implemented",
+        ),
+        Command::TraceStart => Response::error(
+            &req.id,
+            ErrorCode::NotImplemented,
+            "trace_start not yet implemented",
+        ),
+        Command::TraceStop => Response::error(
+            &req.id,
+            ErrorCode::NotImplemented,
+            "trace_stop not yet implemented",
+        ),
+        Command::JsInit => Response::error(
+            &req.id,
+            ErrorCode::NotImplemented,
+            "jsinit not yet implemented",
+        ),
+        Command::LoadJs => Response::error(
+            &req.id,
+            ErrorCode::NotImplemented,
+            "loadjs not yet implemented",
+        ),
+
+        Command::Unknown(ref name) => Response::error(
+            &req.id,
+            ErrorCode::UnknownCommand,
+            format!("unknown command: {name}"),
+        ),
     }
 }
 
-fn write_frame<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
-where
-    W: Write,
-{
-    let len = u32::try_from(payload.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "frame payload is larger than u32::MAX",
-        )
-    })?;
-
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(payload)?;
-    writer.flush()?;
-    Ok(())
+/// 判断命令是否应关闭连接。
+fn is_exit(req: &Request) -> bool {
+    req.parsed_command() == Command::Exit
 }
 
-fn read_frame<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
-where
-    R: Read,
-{
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
-
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("frame too large: {len} bytes"),
-        ));
-    }
-
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
-    Ok(Some(payload))
-}
+// ---------------------------------------------------------------------------
+// Android 平台入口和网络逻辑
+// ---------------------------------------------------------------------------
 
 #[cfg(target_os = "android")]
 mod android {
     use super::{
-        configured_host, configured_port, execute_command, reconnect_delay_ms, should_close,
-        JNI_VERSION_1_6,
+        configured_host, configured_port, dispatch, is_exit, reconnect_delay_ms, JNI_VERSION_1_6,
     };
+    use agent_protocol::{frame, Capabilities, Command, Hello, Request};
     use std::ffi::{c_char, c_void, CString};
     use std::io;
     use std::net::TcpStream;
@@ -252,9 +275,7 @@ mod android {
                         last_retry_log = Some(Instant::now());
                     }
 
-                    eprintln!(
-                        "agent connect error to {host}:{port}: {error}"
-                    );
+                    eprintln!("agent connect error to {host}:{port}: {error}");
                 }
             }
 
@@ -268,72 +289,126 @@ mod android {
         Ok(stream)
     }
 
+    /// 处理一个 TCP 会话：发送 Hello 握手，然后进入请求/响应循环。
     fn handle_session(mut stream: TcpStream) -> io::Result<()> {
-        let greeting = format!(
-            "HELLO_AGENT pid={} transport=tcp target={}:{}\n",
+        // 发送结构化 Hello 握手
+        let hello = Hello::new(
             std::process::id(),
-            configured_host(),
-            configured_port()
+            Capabilities::from_commands(Command::supported_commands()),
         );
+        frame::write_message(&mut stream, &hello)?;
 
-        super::write_frame(&mut stream, greeting.as_bytes())?;
-
+        // 请求/响应循环
         loop {
-            let Some(frame) = super::read_frame(&mut stream)? else {
+            let Some(req) = frame::read_message::<_, Request>(&mut stream)? else {
                 return Ok(());
             };
 
-            let command = String::from_utf8_lossy(&frame).into_owned();
+            let should_exit = is_exit(&req);
+            let resp = dispatch(&req);
+            frame::write_message(&mut stream, &resp)?;
 
-            let response = execute_command(&command);
-            super::write_frame(&mut stream, response.as_bytes())?;
-
-            if should_close(&command) {
+            if should_exit {
                 return Ok(());
             }
         }
     }
 }
 
+// 非 Android 平台的空导出 (保持链接兼容)
 #[cfg(not(target_os = "android"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn hello_entry() {}
 
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use agent_protocol::frame;
     use std::io::Cursor;
 
-    use super::{execute_command, read_frame, should_close, write_frame};
-
     #[test]
-    fn ping_returns_process_info() {
-        assert!(execute_command("ping").starts_with("PONG pid="));
+    fn ping_returns_pid() {
+        let req = Request::new("1", "ping");
+        let resp = dispatch(&req);
+        assert_eq!(resp.status, agent_protocol::Status::Ok);
+        assert!(resp.data.as_ref().unwrap()["pid"].is_number());
     }
 
     #[test]
-    fn echo_returns_payload() {
-        assert_eq!(execute_command("echo hello tcp"), "hello tcp");
+    fn echo_with_text() {
+        let req = Request::with_args("2", "echo", json!({"text": "hello tcp"}));
+        let resp = dispatch(&req);
+        assert_eq!(resp.status, agent_protocol::Status::Ok);
+        assert_eq!(resp.data.as_ref().unwrap()["text"], "hello tcp");
     }
 
     #[test]
-    fn help_lists_supported_commands() {
-        assert!(execute_command("help").contains("echo <text>"));
+    fn echo_without_text_is_error() {
+        let req = Request::new("3", "echo");
+        let resp = dispatch(&req);
+        assert_eq!(resp.status, agent_protocol::Status::Error);
+        assert_eq!(resp.error_code, Some(ErrorCode::InvalidArgs));
     }
 
     #[test]
-    fn quit_is_terminal() {
-        assert!(should_close("quit\n"));
-        assert!(should_close("exit"));
-        assert!(!should_close("ping"));
+    fn help_lists_commands() {
+        let req = Request::new("4", "help");
+        let resp = dispatch(&req);
+        assert_eq!(resp.status, agent_protocol::Status::Ok);
+        let cmds = resp.data.as_ref().unwrap()["commands"].as_array().unwrap();
+        assert!(cmds.iter().any(|c| c == "ping"));
     }
 
     #[test]
-    fn frame_roundtrip() {
-        let mut buffer = Vec::new();
-        write_frame(&mut buffer, b"ping").unwrap();
+    fn exit_returns_ok_empty() {
+        let req = Request::new("5", "exit");
+        let resp = dispatch(&req);
+        assert_eq!(resp.status, agent_protocol::Status::Ok);
+        assert!(resp.data.is_none());
+        assert!(is_exit(&req));
+    }
 
-        let mut cursor = Cursor::new(buffer);
-        let frame = read_frame(&mut cursor).unwrap().unwrap();
-        assert_eq!(frame, b"ping");
+    #[test]
+    fn unknown_command_is_error() {
+        let req = Request::new("6", "nonexistent");
+        let resp = dispatch(&req);
+        assert_eq!(resp.status, agent_protocol::Status::Error);
+        assert_eq!(resp.error_code, Some(ErrorCode::UnknownCommand));
+    }
+
+    #[test]
+    fn stub_commands_return_not_implemented() {
+        for cmd in &["list_modules", "list_threads", "trace_start", "trace_stop", "jsinit", "loadjs"] {
+            let req = Request::new("s", *cmd);
+            let resp = dispatch(&req);
+            assert_eq!(resp.status, agent_protocol::Status::Error);
+            assert_eq!(resp.error_code, Some(ErrorCode::NotImplemented));
+        }
+    }
+
+    #[test]
+    fn get_info_returns_pid_and_version() {
+        let req = Request::new("7", "get_info");
+        let resp = dispatch(&req);
+        assert_eq!(resp.status, agent_protocol::Status::Ok);
+        let data = resp.data.as_ref().unwrap();
+        assert!(data["pid"].is_number());
+        assert_eq!(data["protocol_version"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn frame_message_roundtrip() {
+        let req = Request::new("rt", "ping");
+        let mut buf = Vec::new();
+        frame::write_message(&mut buf, &req).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: Request = frame::read_message(&mut cursor).unwrap().unwrap();
+        assert_eq!(decoded.id, "rt");
+        assert_eq!(decoded.command, "ping");
     }
 }
