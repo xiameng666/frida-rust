@@ -71,6 +71,7 @@ pub enum Command {
     TraceStop,
     JsInit,
     LoadJs,
+    ReloadJs,
     Echo,
     Exit,
     Help,
@@ -92,6 +93,7 @@ impl Command {
             "trace_stop" => Self::TraceStop,
             "jsinit" => Self::JsInit,
             "loadjs" => Self::LoadJs,
+            "reloadjs" => Self::ReloadJs,
             "echo" => Self::Echo,
             "exit" | "quit" => Self::Exit,
             "help" => Self::Help,
@@ -112,6 +114,7 @@ impl Command {
             Self::TraceStop => "trace_stop",
             Self::JsInit => "jsinit",
             Self::LoadJs => "loadjs",
+            Self::ReloadJs => "reloadjs",
             Self::Echo => "echo",
             Self::Exit => "exit",
             Self::Help => "help",
@@ -136,6 +139,7 @@ impl Command {
             "trace_stop",
             "jsinit",
             "loadjs",
+            "reloadjs",
         ]
     }
 }

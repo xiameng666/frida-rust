@@ -169,8 +169,20 @@ fn parse_user_input(input: &str) -> Request {
         "echo" if !rest.is_empty() => {
             Request::with_args(id, verb, json!({ "text": rest }))
         }
-        "loadjs" if !rest.is_empty() => {
-            Request::with_args(id, verb, json!({ "script": rest }))
+        "loadjs" | "reloadjs" if !rest.is_empty() => {
+            // 如果参数是 .js 文件路径，读取文件内容
+            let script = if rest.ends_with(".js") {
+                match std::fs::read_to_string(rest) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("[!] 无法读取文件 {rest}: {e}");
+                        return Request::new(id, verb);
+                    }
+                }
+            } else {
+                rest.to_string()
+            };
+            Request::with_args(id, verb, json!({ "script": script }))
         }
         "find_symbol" if !rest.is_empty() => {
             Request::with_args(id, verb, json!({ "name": rest }))
@@ -299,8 +311,9 @@ fn print_repl_help() {
     println!("    read_memory <addr> [size] - 读取内存 (stub)");
     println!("    trace_start       - 开始跟踪 (stub)");
     println!("    trace_stop        - 停止跟踪 (stub)");
-    println!("    jsinit            - 初始化 JS 引擎 (stub)");
-    println!("    loadjs <script>   - 加载 JS 脚本 (stub)");
+    println!("    jsinit            - 初始化 JS 引擎 (Android)");
+    println!("    loadjs <script>   - 执行 JS 脚本 (Android)");
+    println!("    reloadjs <script> - 热加载 JS 脚本 (Android)");
     println!("    help              - 显示此帮助");
     println!("    quit / exit       - 断开连接");
 }

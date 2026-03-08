@@ -1,3 +1,6 @@
 /target
+quickjs-hook/target
 Cargo.lock
 .vscode
+.idea
+test.js

@@ -5,8 +5,51 @@ fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     let src_path = PathBuf::from(&manifest_dir).join("src");
+    let target = env::var("TARGET").unwrap_or_default();
 
-    // Compile hook_engine.c, arm64_writer.c, and arm64_relocator.c
+    // For Android cross-compilation, derive sysroot from CC env var
+    let android_clang_args: Vec<String> = if target.contains("android") {
+        let cc_key = format!("CC_{}", target.replace('-', "_"));
+        env::var(&cc_key)
+            .ok()
+            .and_then(|cc| {
+                let cc_path = PathBuf::from(&cc);
+                let toolchain = cc_path.parent()?.parent()?;
+                let sysroot = toolchain.join("sysroot");
+                if sysroot.exists() {
+                    let mut args = vec![
+                        format!("--sysroot={}", sysroot.display()),
+                        "-target".to_string(),
+                        target.clone(),
+                        // Explicit include paths for Windows libclang cross-compilation
+                        format!("-isystem{}", sysroot.join("usr").join("include").display()),
+                        format!("-isystem{}", sysroot.join("usr").join("include").join("aarch64-linux-android").display()),
+                    ];
+                    // Also add LLVM's own resource dir include
+                    let llvm_include = toolchain.join("lib").join("clang");
+                    if llvm_include.exists() {
+                        // Find the version directory (e.g. lib/clang/18/include)
+                        if let Ok(entries) = std::fs::read_dir(&llvm_include) {
+                            for entry in entries.flatten() {
+                                let inc = entry.path().join("include");
+                                if inc.exists() {
+                                    args.push(format!("-isystem{}", inc.display()));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(args)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    // Compile hook_engine.c
     cc::Build::new()
         .file(src_path.join("hook_engine.c"))
         .file(src_path.join("arm64_writer.c"))
@@ -47,12 +90,16 @@ fn main() {
         build.compile("quickjs");
 
         // Generate bindings for QuickJS + wrapper
-        let bindings = bindgen::Builder::default()
+        let mut qjs_builder = bindgen::Builder::default()
             .header(quickjs_src.join("quickjs.h").to_string_lossy().to_string())
             .header(src_path.join("quickjs_wrapper.h").to_string_lossy().to_string())
             .clang_arg(format!("-I{}", quickjs_src.display()))
             .clang_arg(format!("-I{}", src_path.display()))
-            .clang_arg("-xc")
+            .clang_arg("-xc");
+        for arg in &android_clang_args {
+            qjs_builder = qjs_builder.clang_arg(arg);
+        }
+        let bindings = qjs_builder
             .generate_comments(true)
             .derive_debug(true)
             .derive_default(true)
@@ -84,12 +131,16 @@ fn main() {
     }
 
     // Generate bindings for hook_engine (includes arm64_writer and arm64_relocator)
-    let hook_bindings = bindgen::Builder::default()
+    let mut hook_builder = bindgen::Builder::default()
         .header(src_path.join("hook_engine.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_writer.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_relocator.h").to_string_lossy().to_string())
         .clang_arg(format!("-I{}", src_path.display()))
-        .clang_arg("-xc")
+        .clang_arg("-xc");
+    for arg in &android_clang_args {
+        hook_builder = hook_builder.clang_arg(arg);
+    }
+    let hook_bindings = hook_builder
         .generate_comments(true)
         .derive_debug(true)
         .derive_default(true)

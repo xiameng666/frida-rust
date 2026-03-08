@@ -90,7 +90,19 @@ static void free_entry(HookEntry* entry) {
 
 /* Flush instruction cache */
 void hook_flush_cache(void* start, size_t size) {
+#if defined(__aarch64__)
+    uintptr_t addr = (uintptr_t)start & ~63UL;
+    uintptr_t end  = (uintptr_t)start + size;
+    for (; addr < end; addr += 64)
+        __asm__ volatile("dc cvau, %0" :: "r"(addr) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    addr = (uintptr_t)start & ~63UL;
+    for (; addr < end; addr += 64)
+        __asm__ volatile("ic ivau, %0" :: "r"(addr) : "memory");
+    __asm__ volatile("dsb ish\nisb" ::: "memory");
+#else
     __builtin___clear_cache((char*)start, (char*)start + size);
+#endif
 }
 
 /*

@@ -36,6 +36,8 @@ pub use runtime::JSRuntime;
 pub use value::JSValue;
 pub use jsapi::console::set_console_callback;
 pub use jsapi::hook_api::cleanup_hooks;
+pub use jsapi::interceptor::cleanup_interceptor_hooks;
+pub use jsapi::send::drain_send_messages;
 
 use std::sync::Mutex;
 
@@ -117,8 +119,9 @@ impl JSEngine {
 
 impl Drop for JSEngine {
     fn drop(&mut self) {
-        // Cleanup hooks before dropping context
+        // 清理所有 hook（低级 API + Interceptor）
         cleanup_hooks();
+        cleanup_interceptor_hooks();
     }
 }
 
@@ -128,6 +131,28 @@ unsafe impl Sync for JSEngine {}
 
 /// Get or initialize the global JS engine
 pub fn get_or_init_engine() -> Result<(), String> {
+    // 确保 hook 引擎已初始化（仅 Android）
+    #[cfg(target_os = "android")]
+    {
+        static HOOK_INIT: std::sync::Once = std::sync::Once::new();
+        HOOK_INIT.call_once(|| {
+            const POOL_SIZE: usize = 1024 * 1024; // 1 MB
+            let mem = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    POOL_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if mem != libc::MAP_FAILED {
+                let _ = init_hook_engine(mem as *mut u8, POOL_SIZE);
+            }
+        });
+    }
+
     let mut engine = JS_ENGINE.lock().map_err(|e| format!("Failed to lock JS engine: {}", e))?;
     if engine.is_none() {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);

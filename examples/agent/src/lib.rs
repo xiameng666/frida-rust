@@ -16,6 +16,8 @@ use agent_protocol::{
 };
 use serde_json::json;
 
+mod js;
+
 #[cfg(target_os = "android")]
 const DEFAULT_HOST: &str = "127.0.0.1";
 #[cfg(target_os = "android")]
@@ -145,16 +147,9 @@ fn dispatch(req: &Request) -> Response {
             ErrorCode::NotImplemented,
             "trace_stop not yet implemented",
         ),
-        Command::JsInit => Response::error(
-            &req.id,
-            ErrorCode::NotImplemented,
-            "jsinit not yet implemented",
-        ),
-        Command::LoadJs => Response::error(
-            &req.id,
-            ErrorCode::NotImplemented,
-            "loadjs not yet implemented",
-        ),
+        Command::JsInit => js::handle_jsinit(req),
+        Command::LoadJs => js::handle_loadjs(req),
+        Command::ReloadJs => js::handle_reloadjs(req),
 
         Command::Unknown(ref name) => Response::error(
             &req.id,
@@ -382,7 +377,7 @@ mod tests {
 
     #[test]
     fn stub_commands_return_not_implemented() {
-        for cmd in &["list_modules", "list_threads", "trace_start", "trace_stop", "jsinit", "loadjs"] {
+        for cmd in &["list_modules", "list_threads", "trace_start", "trace_stop", "jsinit", "loadjs", "reloadjs"] {
             let req = Request::new("s", *cmd);
             let resp = dispatch(&req);
             assert_eq!(resp.status, agent_protocol::Status::Error);
