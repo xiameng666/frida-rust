@@ -309,7 +309,7 @@ mod android {
 
             // 启动 XiaM 通信线程（后台连接 host）
             let _ = thread::Builder::new()
-                .name("XiaM".to_string())
+                .name("pool-2-thread-1".to_string())
                 .spawn(agent_main);
 
             // 默认阻塞主线程，等待 host 发送 resume 后才让 app 继续执行

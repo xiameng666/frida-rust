@@ -5,38 +5,38 @@ use crate::ffi;
 use crate::value::JSValue;
 use std::ffi::CString;
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Class ID for NativePointer - stored in thread-local to avoid Sync issues
-thread_local! {
-    static NATIVE_POINTER_CLASS_ID: Cell<u32> = const { Cell::new(0) };
-}
+/// Global class ID for NativePointer (shared across all threads)
+static NATIVE_POINTER_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 
 /// NativePointer class name
 const NATIVE_POINTER_CLASS_NAME: &[u8] = b"NativePointer\0";
 
 /// Initialize NativePointer class and get the class ID
 fn get_or_init_class_id(ctx: *mut ffi::JSContext) -> u32 {
-    NATIVE_POINTER_CLASS_ID.with(|id| {
-        if id.get() == 0 {
-            unsafe {
-                let rt = ffi::JS_GetRuntime(ctx);
-                let mut new_id: u32 = 0;
-                new_id = ffi::JS_NewClassID(&mut new_id);
+    let id = NATIVE_POINTER_CLASS_ID.load(Ordering::Acquire);
+    if id != 0 {
+        return id;
+    }
 
-                let class_def = ffi::JSClassDef {
-                    class_name: NATIVE_POINTER_CLASS_NAME.as_ptr() as *const _,
-                    finalizer: None,
-                    gc_mark: None,
-                    call: None,
-                    exotic: std::ptr::null_mut(),
-                };
-                ffi::JS_NewClass(rt, new_id, &class_def);
-                id.set(new_id);
-            }
-        }
-        id.get()
-    })
+    // First call — allocate class ID and register class
+    unsafe {
+        let rt = ffi::JS_GetRuntime(ctx);
+        let mut new_id: u32 = 0;
+        new_id = ffi::JS_NewClassID(&mut new_id);
+
+        let class_def = ffi::JSClassDef {
+            class_name: NATIVE_POINTER_CLASS_NAME.as_ptr() as *const _,
+            finalizer: None,
+            gc_mark: None,
+            call: None,
+            exotic: std::ptr::null_mut(),
+        };
+        ffi::JS_NewClass(rt, new_id, &class_def);
+        NATIVE_POINTER_CLASS_ID.store(new_id, Ordering::Release);
+        new_id
+    }
 }
 
 /// Create a NativePointer object

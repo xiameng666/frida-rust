@@ -70,7 +70,7 @@ typedef struct {
 /*
  * Initialize the hook engine
  *
- * @param exec_mem      Pointer to executable memory region (RWX)
+ * @param exec_mem      Pointer to executable memory pool (mapped R-X)
  * @param size          Size of the memory region
  * @return              0 on success, -1 on failure
  */
@@ -155,7 +155,6 @@ int hook_write_jump(void* dst, void* target);
  * @param size          Size of region
  */
 void hook_flush_cache(void* start, size_t size);
-
 
 #ifdef __cplusplus
 }

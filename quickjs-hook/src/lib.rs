@@ -141,7 +141,7 @@ pub fn get_or_init_engine() -> Result<(), String> {
                 libc::mmap(
                     std::ptr::null_mut(),
                     POOL_SIZE,
-                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                     -1,
                     0,
@@ -149,6 +149,14 @@ pub fn get_or_init_engine() -> Result<(), String> {
             };
             if mem != libc::MAP_FAILED {
                 let _ = init_hook_engine(mem as *mut u8, POOL_SIZE);
+                // Tighten to R-X: hook engine writes to pool via /proc/self/mem
+                unsafe {
+                    libc::mprotect(
+                        mem,
+                        POOL_SIZE,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                    );
+                }
             }
         });
     }

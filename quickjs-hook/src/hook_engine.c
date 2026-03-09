@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdlib.h>
 
 /* wxshadow prctl operations - shadow page patching */
 #ifndef PR_WXSHADOW_PATCH
@@ -43,19 +44,19 @@ static HookEngine g_engine = {0};
 #define THUNK_ALLOC_SIZE 512
 
 /* --- Pool permission management ---
- * 当前策略：保持 RWX 不切换。
- * SELinux 在现代 Android 上会阻止 R-X → RWX 的 mprotect，
- * 导致 hook_attach 失败。初始 mmap(RWX) 成功后不再变更权限。
- * TODO: 后续用 /proc/self/mem 写入实现真正 W^X 隐身。
+ * Pool 始终保持 R-X 权限，所有写入通过 /proc/self/mem 完成。
+ * /proc/self/maps 中不会出现 rwxp 匿名映射。
+ * HookEntry 结构体在堆上分配(malloc)，不占用 R-X pool。
+ * pool_make_writable / pool_make_executable 保留为 no-op 以保持调用结构。
  */
 
 static int pool_make_writable(void) {
-    /* RWX 池不需要切换 */
+    /* Pool 始终 R-X，写入通过 /proc/self/mem */
     return 0;
 }
 
 static int pool_make_executable(void) {
-    /* RWX 池不需要切换 */
+    /* Pool 始终 R-X，无需切换 */
     return 0;
 }
 
@@ -81,7 +82,7 @@ static HookEntry* alloc_entry(void) {
         entry->thunk = saved_thunk;
         entry->thunk_alloc = saved_thunk_alloc;
     } else {
-        entry = (HookEntry*)hook_alloc(sizeof(HookEntry));
+        entry = (HookEntry*)malloc(sizeof(HookEntry));
         if (entry) memset(entry, 0, sizeof(HookEntry));
     }
 
@@ -251,8 +252,10 @@ void* hook_alloc(size_t size) {
 size_t hook_relocate_instructions_ex(void* src, uint64_t src_base_addr, void* dst, size_t min_bytes) {
     Arm64Writer w;
     Arm64Relocator r;
+    uint8_t temp[256];
 
-    arm64_writer_init(&w, dst, (uint64_t)dst, 256);
+    /* Write to temp buffer; PC = dst (pool address) for correct relocation */
+    arm64_writer_init(&w, temp, (uint64_t)dst, 256);
     arm64_relocator_init(&r, src, src_base_addr, &w);
 
     size_t src_offset = 0;
@@ -266,6 +269,12 @@ size_t hook_relocate_instructions_ex(void* src, uint64_t src_base_addr, void* ds
     arm64_writer_flush(&w);
 
     size_t written = arm64_writer_offset(&w);
+
+    /* Copy relocated code to R-X pool via /proc/self/mem */
+    if (written > 0) {
+        proc_mem_write(dst, temp, written);
+    }
+
     arm64_writer_clear(&w);
     arm64_relocator_clear(&r);
 
@@ -296,7 +305,7 @@ int hook_engine_init(void* exec_mem, size_t size) {
     pthread_mutex_init(&g_engine.lock, NULL);
     g_engine.initialized = 1;
 
-    /* Tighten pool permissions: caller provides RWX, we keep R-X until needed */
+    /* Pool is R-X; all writes go through /proc/self/mem */
     pool_make_executable();
 
     return 0;
@@ -326,16 +335,9 @@ void* hook_install(void* target, void* replacement, int stealth) {
         return NULL;
     }
 
-    /* Make pool writable for allocation and code generation */
-    if (pool_make_writable() != 0) {
-        pthread_mutex_unlock(&g_engine.lock);
-        return NULL;
-    }
-
-    /* Allocate hook entry (reuse from free list if possible) */
+    /* Allocate hook entry on heap */
     HookEntry* entry = alloc_entry();
     if (!entry) {
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -343,53 +345,50 @@ void* hook_install(void* target, void* replacement, int stealth) {
     entry->target = target;
     entry->replacement = replacement;
 
-    /* Make target page readable+writable FIRST (execute-only pages) */
-    uintptr_t target_page = (uintptr_t)target & ~0xFFF;
-    if (!stealth) {
-        if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            free_entry(entry);
-            pool_make_executable();
-            pthread_mutex_unlock(&g_engine.lock);
-            return NULL;
-        }
-    }
-
-    /* Allocate trampoline space (reuse if available and large enough) */
+    /* Allocate trampoline space in R-X pool */
     if (!entry->trampoline || entry->trampoline_alloc < TRAMPOLINE_ALLOC_SIZE) {
         entry->trampoline = hook_alloc(TRAMPOLINE_ALLOC_SIZE);
         entry->trampoline_alloc = TRAMPOLINE_ALLOC_SIZE;
     }
     if (!entry->trampoline) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
 
-    /* Save original bytes (target page is now readable) */
-    memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
+    /* Read original bytes via /proc/self/mem (works on execute-only pages) */
+    if (proc_mem_read(entry->original_bytes, target, MIN_HOOK_SIZE) != 0) {
+        uintptr_t target_page = (uintptr_t)target & ~0xFFF;
+        if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
+            return NULL;
+        }
+        memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
+    }
     entry->original_size = MIN_HOOK_SIZE;
 
-    /* Relocate original instructions to trampoline */
-    size_t relocated_size = hook_relocate_instructions(target, entry->trampoline, MIN_HOOK_SIZE);
+    /* Relocate original instructions to trampoline (writes to pool via proc_mem_write) */
+    size_t relocated_size = hook_relocate_instructions_ex(
+        entry->original_bytes, (uint64_t)target, entry->trampoline, MIN_HOOK_SIZE);
 
-    /* Write jump back to original code after the hook */
-    void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
-    int jump_result = hook_write_jump((uint8_t*)entry->trampoline + relocated_size, jump_back_target);
-    if (jump_result < 0) {
-        free_entry(entry);
-        pool_make_executable();
-        pthread_mutex_unlock(&g_engine.lock);
-        return NULL;
+    /* Write jump back → temp buffer then proc_mem_write to pool */
+    {
+        uint8_t jump_temp[MIN_HOOK_SIZE];
+        void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
+        int jump_result = hook_write_jump(jump_temp, jump_back_target);
+        if (jump_result < 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
+            return NULL;
+        }
+        proc_mem_write((uint8_t*)entry->trampoline + relocated_size, jump_temp, jump_result);
     }
 
-    /* Tighten pool back to R-X before patching target */
-    pool_make_executable();
-
-    if (stealth) {
-        /* Stealth mode: write jump to a temp buffer, then patch via wxshadow */
+    /* Patch target: write jump to replacement */
+    {
         uint8_t jump_buf[MIN_HOOK_SIZE];
-        jump_result = hook_write_jump(jump_buf, replacement);
+        int jump_result = hook_write_jump(jump_buf, replacement);
         if (jump_result < 0) {
             free_entry(entry);
             pthread_mutex_unlock(&g_engine.lock);
@@ -397,23 +396,36 @@ void* hook_install(void* target, void* replacement, int stealth) {
         }
         /* Pad remaining bytes with BRK */
         for (int i = jump_result; i < MIN_HOOK_SIZE; i += 4) {
-            *(uint32_t*)(jump_buf + i) = 0xD4200000 | (0xFFFF << 5); /* BRK #0xFFFF */
+            *(uint32_t*)(jump_buf + i) = 0xD4200000 | (0xFFFF << 5);
         }
-        if (wxshadow_patch(target, jump_buf, MIN_HOOK_SIZE) != 0) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return NULL;
+
+        int patched = 0;
+
+        if (stealth) {
+            if (wxshadow_patch(target, jump_buf, MIN_HOOK_SIZE) == 0) {
+                entry->stealth = 1;
+                patched = 1;
+            }
         }
-        entry->stealth = 1;
-    } else {
-        /* Normal mode: target page already RWX from above */
-        jump_result = hook_write_jump(target, replacement);
-        if (jump_result < 0) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return NULL;
+
+        if (!patched) {
+            if (proc_mem_write(target, jump_buf, MIN_HOOK_SIZE) == 0) {
+                entry->stealth = 0;
+                patched = 1;
+            }
         }
-        entry->stealth = 0;
+
+        if (!patched) {
+            /* Last resort: mprotect + direct write */
+            uintptr_t target_page = (uintptr_t)target & ~0xFFF;
+            if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                free_entry(entry);
+                pthread_mutex_unlock(&g_engine.lock);
+                return NULL;
+            }
+            memcpy(target, jump_buf, MIN_HOOK_SIZE);
+            entry->stealth = 0;
+        }
     }
 
     /* Flush cache */
@@ -445,8 +457,10 @@ static void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
         entry->thunk_alloc = THUNK_ALLOC_SIZE;
     }
 
+    uint8_t temp[THUNK_ALLOC_SIZE];
     Arm64Writer w;
-    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
+    /* Write to temp buffer; PC = thunk_mem for correct addressing */
+    arm64_writer_init(&w, temp, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
 
     /* Allocate stack space for HookContext (256 bytes) + saved LR (8 bytes) + alignment */
     /* HookContext: x0-x30 (31*8=248) + sp (8) + pc (8) + nzcv (8) = 272 bytes */
@@ -521,6 +535,10 @@ static void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     arm64_writer_flush(&w);
 
     *thunk_size_out = arm64_writer_offset(&w);
+
+    /* Copy generated thunk to R-X pool via /proc/self/mem */
+    proc_mem_write(thunk_mem, temp, *thunk_size_out);
+
     arm64_writer_clear(&w);
 
     return thunk_mem;
@@ -603,14 +621,18 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     size_t relocated_size = hook_relocate_instructions_ex(
         entry->original_bytes, (uint64_t)target, entry->trampoline, MIN_HOOK_SIZE);
 
-    /* Write jump back to original code after the hook */
-    void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
-    int jump_result = hook_write_jump((uint8_t*)entry->trampoline + relocated_size, jump_back_target);
-    if (jump_result < 0) {
-        free_entry(entry);
-        pool_make_executable();
-        pthread_mutex_unlock(&g_engine.lock);
-        return jump_result;
+    /* Write jump back → temp buffer then proc_mem_write to pool */
+    {
+        uint8_t jump_temp[MIN_HOOK_SIZE];
+        void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
+        int jump_result = hook_write_jump(jump_temp, jump_back_target);
+        if (jump_result < 0) {
+            free_entry(entry);
+            pool_make_executable();
+            pthread_mutex_unlock(&g_engine.lock);
+            return jump_result;
+        }
+        proc_mem_write((uint8_t*)entry->trampoline + relocated_size, jump_temp, jump_result);
     }
 
     /* Generate thunk code */
@@ -632,7 +654,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
      */
     {
         uint8_t jump_buf[MIN_HOOK_SIZE];
-        jump_result = hook_write_jump(jump_buf, thunk_mem);
+        int jump_result = hook_write_jump(jump_buf, thunk_mem);
         if (jump_result < 0) {
             free_entry(entry);
             pthread_mutex_unlock(&g_engine.lock);
@@ -761,10 +783,7 @@ void hook_engine_cleanup(void) {
 
     pthread_mutex_lock(&g_engine.lock);
 
-    /* Make pool writable for cleanup state reset */
-    pool_make_writable();
-
-    /* Restore all hooks */
+    /* Restore all hooks and free heap-allocated entries */
     HookEntry* entry = g_engine.hooks;
     while (entry) {
         if (entry->stealth) {
@@ -777,7 +796,17 @@ void hook_engine_cleanup(void) {
             }
         }
         hook_flush_cache(entry->target, entry->original_size);
-        entry = entry->next;
+        HookEntry* next = entry->next;
+        free(entry);
+        entry = next;
+    }
+
+    /* Free entries in free list */
+    HookEntry* fentry = g_engine.free_list;
+    while (fentry) {
+        HookEntry* next = fentry->next;
+        free(fentry);
+        fentry = next;
     }
 
     /* Reset state */
