@@ -2,7 +2,7 @@
 name = "injector"
 version = "0.1.0"
 edition = "2021"
-description = "XiaM Zymbiote injector — ptrace-free spawn injection via /proc/pid/mem"
+description = "XiaM ptrace+memfd injector — stealth SO loading via memory fd"
 
 [[bin]]
 name = "xiam-inject"
@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+nix = { version = "0.29", features = ["ptrace", "signal", "process", "socket", "uio"] }
