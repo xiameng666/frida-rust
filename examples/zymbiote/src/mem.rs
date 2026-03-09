@@ -2,14 +2,19 @@
 
 use crate::proc::MemRegion;
 
-const MAX_REGION_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+const MAX_REGION_SIZE: usize = 512 * 1024 * 1024; // 512 MB
 const CHUNK_SIZE: usize = 256 * 1024; // 256 KB
 
 /// Search a memory region (via an open /proc/<pid>/mem fd) for an 8-byte needle.
 /// Returns the virtual address where the needle was found, or None.
 pub fn search(fd: i32, region: &MemRegion, needle: usize) -> Option<usize> {
     let size = region.size();
-    if size > MAX_REGION_SIZE || size < 8 {
+    if size < 8 {
+        return None;
+    }
+    if size > MAX_REGION_SIZE {
+        eprintln!("  [!] skipping oversized region 0x{:x}-0x{:x} ({} MB) {}",
+            region.start, region.end, size / (1024*1024), region.path);
         return None;
     }
 

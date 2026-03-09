@@ -7,10 +7,13 @@
 //!   2. remote memfd_create("jit-cache", MFD_CLOEXEC)
 //!   3. write agent SO to /proc/<pid>/fd/<memfd> from injector side (root)
 //!   4. remote dlopen("/proc/self/fd/<memfd>", RTLD_NOW)
-//!   5. remote close(memfd)
-//!   6. remote dlsym(handle, "hello_entry")
-//!   7. remote pthread_create(entry)
-//!   8. ptrace detach
+//!   5. remote dlsym(handle, "hello_entry")
+//!   6. remote pthread_create(entry)
+//!   7. ptrace detach
+//!
+//! NOTE: memfd is intentionally NOT closed — the linker retains the
+//! path "/proc/self/fd/<N>" in its soinfo and may re-access it
+//! during subsequent dlopen calls from other threads.
 
 use crate::ptrace;
 use crate::remote::{get_dl_base, get_libc_base, write_bytes};
@@ -46,7 +49,6 @@ pub fn inject_memfd(pid: i32, agent_so: &[u8]) -> Result<(), String> {
     let fn_malloc = resolve_libc!(malloc);
     let fn_free = resolve_libc!(free);
     let fn_memfd_create = resolve_libc!(memfd_create);
-    let fn_close = resolve_libc!(close);
     let fn_pthread_create = resolve_libc!(pthread_create);
     let fn_pthread_detach = resolve_libc!(pthread_detach);
     let fn_dlopen = resolve_dl!(dlopen);
@@ -104,18 +106,16 @@ pub fn inject_memfd(pid: i32, agent_so: &[u8]) -> Result<(), String> {
     ptrace::call_remote_function(pid, fn_free, &[path_addr])?;
 
     if handle == 0 {
-        // Try to clean up before failing.
-        let _ = ptrace::call_remote_function(pid, fn_close, &[memfd]);
         ptrace::detach(pid)?;
         return Err("remote dlopen returned NULL".into());
     }
     eprintln!("[+] dlopen handle=0x{handle:x}");
 
-    // ---- 6. remote close(memfd) ----
-    ptrace::call_remote_function(pid, fn_close, &[memfd])?;
-    eprintln!("[+] memfd closed");
+    // NOTE: memfd fd is intentionally kept open — closing it causes the
+    // linker's soinfo path to become stale, which can SIGILL when other
+    // threads call dlopen() and the linker walks its namespace.
 
-    // ---- 7. remote dlsym(handle, "hello_entry") ----
+    // ---- 6. remote dlsym(handle, "hello_entry") ----
     let sym_name = b"hello_entry\0";
     let sym_addr = write_str(sym_name)?;
     let entry = ptrace::call_remote_function(pid, fn_dlsym, &[handle, sym_addr])?;
