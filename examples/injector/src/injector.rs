@@ -136,12 +136,6 @@ impl Injector {
         }
     }
 
-    /// Disarm the Drop guard so the hook stays active
-    /// (used when the daemon wants to keep running without restoring on drop).
-    pub fn disarm(&mut self) {
-        self.need_restore = false;
-    }
-
     /// Restore Zygote to its original state.
     pub fn restore(&mut self) {
         if !self.need_restore {

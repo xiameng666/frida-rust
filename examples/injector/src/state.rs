@@ -87,11 +87,6 @@ impl InjectState {
     pub fn remove() {
         let _ = fs::remove_file(STATE_PATH);
     }
-
-    /// Check if state file exists.
-    pub fn exists() -> bool {
-        fs::metadata(STATE_PATH).is_ok()
-    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
