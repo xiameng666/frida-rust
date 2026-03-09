@@ -134,7 +134,8 @@ fn run(config: Config) -> io::Result<()> {
     Ok(())
 }
 
-/// Spawn 模式自动化序列：loadjs → resumeï¼引擎自动初始化ï¼
+/// Spawn 模式自动化序列：loadjs → resume
+/// 先注入脚本（确保 hook 在 app 代码执行前就位），再放行主线程。
 fn spawn_sequence(
     writer: &Arc<Mutex<TcpStream>>,
     resp_rx: &mpsc::Receiver<Response>,

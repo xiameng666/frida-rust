@@ -10,6 +10,7 @@ members = [
     "examples/agent-protocol",
     "examples/agent",
     "examples/agent-host",
+    "examples/injector",
 ]
 exclude = ["quickjs-hook"]
 # We miss our linux_no_std example from the default members since `cargo check`

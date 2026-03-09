@@ -1,4 +1,5 @@
 # XiaM justfile
+export NO_COLOR := "1"
 
 # Android NDK 配置
 android_target := "aarch64-linux-android"
@@ -37,6 +38,24 @@ push: agent
 # 部署（push 已包含设权限）
 deploy: push
     @echo "deployed to /data/local/tmp/libXiaM.so"
+
+# 编译 injector (Android)
+injector:
+    cargo build -p injector --target {{android_target}} --release
+
+# 推送 injector 到设备
+push-injector: injector
+    -adb shell su -c "pkill xiam-inject" 2>/dev/null
+    adb push target/{{android_target}}/release/xiam-inject //sdcard/xiam-inject
+    adb shell su -c "cp /sdcard/xiam-inject /data/local/tmp/xiam-inject"
+    adb shell su -c "chmod 755 /data/local/tmp/xiam-inject"
+    adb shell rm //sdcard/xiam-inject
+
+# 一键注入: just inject com.example.app [so_path]
+inject pkg so="/data/local/tmp/libXiaM.so":
+    just push-injector
+    just deploy
+    adb shell su -c "/data/local/tmp/xiam-inject '{{pkg}}' '{{so}}'"
 
 # adb 端口转发
 forward:
