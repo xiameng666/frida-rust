@@ -15,6 +15,12 @@ use std::mem::zeroed;
 use std::os::unix::io::FromRawFd;
 use std::thread::{self, JoinHandle};
 
+/// Write to stderr without panicking (safe for use inside Drop).
+fn log_safe(msg: &str) {
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\n");
+}
+
 /// The JNI mangled name of `android.os.Process.setArgV0Native()`.
 /// Every Android app calls this during startup to set its process name.
 const SET_ARGV0_SYM: &str =
@@ -120,7 +126,7 @@ impl Injector {
 
         // Step 6: Start notification listener
         eprintln!("[6] Starting notify listener...");
-        let (lfd, lhandle) = start_notify_listener(self.agent_so);
+        let (lfd, lhandle) = start_notify_listener(self.agent_so)?;
         self.listener_fd = lfd;
         self.listener_handle = Some(lhandle);
         eprintln!("  [+] Listening on @{}", NOTIFY_SOCKET);
@@ -155,12 +161,13 @@ impl Injector {
     }
 
     /// Restore Zygote to its original state.
+    /// NOTE: this is called from Drop — must never panic (no eprintln!).
     pub fn restore(&mut self) {
         if !self.need_restore {
             return;
         }
 
-        eprintln!("[*] Restoring Zygote...");
+        log_safe("[*] Restoring Zygote...");
         unsafe {
             libc::kill(self.zpid as i32, libc::SIGSTOP);
 
@@ -184,7 +191,7 @@ impl Injector {
         }
 
         self.need_restore = false;
-        eprintln!("[+] Zygote restored");
+        log_safe("[+] Zygote restored");
     }
 
     // -----------------------------------------------------------------------
@@ -495,10 +502,12 @@ impl Drop for Injector {
 ///   3. Signals the stub to continue
 /// Returns `(shutdown_fd, join_handle)`.  The caller keeps `shutdown_fd`
 /// and calls `shutdown()` + `close()` on it to terminate the thread.
-fn start_notify_listener(agent_so: &'static [u8]) -> (i32, JoinHandle<()>) {
+fn start_notify_listener(agent_so: &'static [u8]) -> io::Result<(i32, JoinHandle<()>)> {
     // Create the listener socket before spawning the thread.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    assert!(fd >= 0, "socket() failed");
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
 
     let mut addr: libc::sockaddr_un = unsafe { zeroed() };
     addr.sun_family = libc::AF_UNIX as u16;
@@ -511,14 +520,26 @@ fn start_notify_listener(agent_so: &'static [u8]) -> (i32, JoinHandle<()>) {
     let addr_len = (std::mem::size_of_val(&addr.sun_family) + 1 + len) as u32;
 
     let rc = unsafe { libc::bind(fd, &addr as *const _ as *const _, addr_len) };
-    assert!(rc == 0, "bind(@{NOTIFY_SOCKET}) failed: {}", io::Error::last_os_error());
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
 
     let rc = unsafe { libc::listen(fd, 4) };
-    assert!(rc == 0, "listen() failed");
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
 
     // dup fd so the caller can shutdown() it independently.
     let shutdown_fd = unsafe { libc::dup(fd) };
-    assert!(shutdown_fd >= 0, "dup() failed");
+    if shutdown_fd < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
 
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
 
@@ -554,5 +575,5 @@ fn start_notify_listener(agent_so: &'static [u8]) -> (i32, JoinHandle<()>) {
         }
     });
 
-    (shutdown_fd, handle)
+    Ok((shutdown_fd, handle))
 }

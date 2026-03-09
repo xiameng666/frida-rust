@@ -45,12 +45,12 @@ fn main() {
 
     loop {
         if !RUNNING.load(Ordering::Relaxed) {
-            eprintln!();
+            let _ = writeln!(io::stderr());
             break;
         }
 
         // Print prompt
-        eprint!("xiam> ");
+        let _ = write!(io::stderr(), "xiam> ");
         let _ = io::stderr().flush();
 
         let mut line = String::new();
@@ -75,13 +75,14 @@ fn main() {
         }
     }
 
-    // Cleanup on exit
+    // Cleanup on exit — use write! (not eprintln!) because stderr
+    // may be a broken pipe if the adb session died.
     if let Some(ref mut i) = inj {
         i.restore();
         state::InjectState::remove();
-        eprintln!("[+] Zygote restored");
+        let _ = writeln!(io::stderr(), "[+] Zygote restored");
     }
-    eprintln!("[+] Bye");
+    let _ = writeln!(io::stderr(), "[+] Bye");
 }
 
 // ---------------------------------------------------------------------------
