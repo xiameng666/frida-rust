@@ -153,9 +153,12 @@ pub fn get_or_init_engine() -> Result<(), String> {
             };
             if mem != libc::MAP_FAILED {
                 // RWX pool — both direct writes and execution work.
+                eprintln!("[XiaM-hook] pool: mmap RWX {:?} ({} KB)", mem, POOL_SIZE / 1024);
                 let _ = init_hook_engine(mem as *mut u8, POOL_SIZE);
             } else {
                 // Fallback: RW then tighten to R-X (relies on /proc/self/mem).
+                eprintln!("[XiaM-hook] pool: RWX mmap failed (errno={}), falling back to RW→R-X",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
                 let mem = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
@@ -167,6 +170,7 @@ pub fn get_or_init_engine() -> Result<(), String> {
                     )
                 };
                 if mem != libc::MAP_FAILED {
+                    eprintln!("[XiaM-hook] pool: mmap RW {:?}, will mprotect to R-X (writes via /proc/self/mem)", mem);
                     let _ = init_hook_engine(mem as *mut u8, POOL_SIZE);
                     unsafe {
                         libc::mprotect(
@@ -175,6 +179,8 @@ pub fn get_or_init_engine() -> Result<(), String> {
                             libc::PROT_READ | libc::PROT_EXEC,
                         );
                     }
+                } else {
+                    eprintln!("[XiaM-hook] pool: RW mmap also failed — hook engine disabled!");
                 }
             }
         });

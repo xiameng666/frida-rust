@@ -160,6 +160,9 @@ fn main() {
         .expect("Couldn't write hook_engine bindings!");
 
     println!("cargo:rustc-link-lib=static=hook_engine");
+    if target.contains("android") {
+        println!("cargo:rustc-link-lib=log"); // for __android_log_print in hook_engine.c
+    }
     println!("cargo:rerun-if-changed=src/hook_engine.c");
     println!("cargo:rerun-if-changed=src/hook_engine.h");
     println!("cargo:rerun-if-changed=src/arm64_writer.c");

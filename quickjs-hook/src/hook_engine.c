@@ -16,6 +16,17 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#define HOOK_TAG "XiaM-hook"
+#define HOOK_LOGI(...) __android_log_print(ANDROID_LOG_INFO,  HOOK_TAG, __VA_ARGS__)
+#define HOOK_LOGW(...) __android_log_print(ANDROID_LOG_WARN,  HOOK_TAG, __VA_ARGS__)
+#else
+#define HOOK_LOGI(...) fprintf(stderr, "[hook-info] " __VA_ARGS__)
+#define HOOK_LOGW(...) fprintf(stderr, "[hook-warn] " __VA_ARGS__)
+#endif
 
 /* wxshadow prctl operations - shadow page patching */
 #ifndef PR_WXSHADOW_PATCH
@@ -212,6 +223,8 @@ static int pool_write(void* pool_addr, const void* src, size_t len) {
     if (proc_mem_write(pool_addr, src, len) == 0)
         return 0;
     /* Fallback: direct write — safe when pool is mapped RWX */
+    HOOK_LOGW("pool_write: /proc/self/mem failed for %p (%zu bytes), falling back to direct memcpy",
+              pool_addr, len);
     memcpy(pool_addr, src, len);
     return 0;
 }
@@ -604,8 +617,10 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
      */
     if (proc_mem_read(entry->original_bytes, target, MIN_HOOK_SIZE) != 0) {
         /* Fallback: try mprotect + direct read */
+        HOOK_LOGW("hook_attach: /proc/self/mem read failed for %p, falling back to mprotect+memcpy", target);
         uintptr_t target_page = (uintptr_t)target & ~0xFFF;
         if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            HOOK_LOGW("hook_attach: mprotect fallback also failed for %p (errno=%d)", target, errno);
             free_entry(entry);
             pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
@@ -691,6 +706,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         if (!patched) {
             /* Try /proc/self/mem write (bypasses SELinux mprotect block) */
             if (proc_mem_write(target, jump_buf, MIN_HOOK_SIZE) == 0) {
+                HOOK_LOGI("hook_attach: patched %p via /proc/self/mem", target);
                 entry->stealth = 0;
                 patched = 1;
             }
@@ -698,8 +714,10 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
 
         if (!patched) {
             /* Last resort: mprotect + direct write */
+            HOOK_LOGW("hook_attach: /proc/self/mem write failed for %p, falling back to mprotect+memcpy", target);
             uintptr_t target_page = (uintptr_t)target & ~0xFFF;
             if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                HOOK_LOGW("hook_attach: mprotect fallback also failed for %p (errno=%d)", target, errno);
                 free_entry(entry);
                 pthread_mutex_unlock(&g_engine.lock);
                 return HOOK_ERROR_MPROTECT_FAILED;
@@ -707,6 +725,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
             memcpy(target, jump_buf, MIN_HOOK_SIZE);
             entry->stealth = 0;
             patched = 1;
+            HOOK_LOGI("hook_attach: patched %p via mprotect+memcpy", target);
         }
     }
 
