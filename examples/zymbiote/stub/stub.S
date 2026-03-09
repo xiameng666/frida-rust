@@ -21,12 +21,10 @@
  *   +0x24  socket_name    (108 bytes, null-terminated)
  *
  * Build:
- *   $NDK/toolchains/llvm/prebuilt/*/bin/clang   \
- *       --target=aarch64-linux-android31         \
- *       -nostdlib -nostartfiles -nodefaultlibs    \
+ *   clang --target=aarch64-linux-android31         \
+ *       -nostdlib -nostartfiles -nodefaultlibs      \
  *       -fPIC -O2 -c stub.S -o stub.o
- *   $NDK/toolchains/llvm/prebuilt/*/bin/llvm-objcopy \
- *       -O binary -j .text stub.o stub.bin
+ *   llvm-objcopy -O binary -j .text stub.o stub.bin
  */
 
 /* --- syscall numbers (aarch64) --- */
@@ -117,7 +115,8 @@ _start:
     /* ---- step 4: connect(fd, &addr, computed_len) ---- */
     /* x1 = past the NUL terminator after copy loop
      * addr_len = x1 - sp - 1  (exclude trailing NUL so it matches bind) */
-    sub     x2, x1, sp
+    mov     x4, sp
+    sub     x2, x1, x4
     sub     x2, x2, #1
     mov     x0, x23                     // socket fd
     mov     x1, sp                      // sockaddr_un*

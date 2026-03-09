@@ -1,5 +1,6 @@
 # XiaM justfile
 export NO_COLOR := "1"
+set windows-shell := ["cmd.exe", "/c"]
 
 # Android NDK 配置
 android_target := "aarch64-linux-android"
@@ -45,7 +46,7 @@ injector:
 
 # 推送 injector 到设备
 push-injector: injector
-    -adb shell su -c "pkill xiam-inject" 2>/dev/null
+    -adb shell su -c "pkill xiam-inject" 2>nul
     adb push target/{{android_target}}/release/xiam-inject //sdcard/xiam-inject
     adb shell su -c "cp /sdcard/xiam-inject /data/local/tmp/xiam-inject"
     adb shell su -c "chmod 755 /data/local/tmp/xiam-inject"
@@ -70,7 +71,7 @@ all: agent host injector
 
 # 编译 zymbiote stub (ARM64 shellcode → stub.bin)
 zymbiote-stub:
-    {{ndk_bin}}\\clang.cmd --target=aarch64-linux-android{{android_api}} -nostdlib -nostartfiles -nodefaultlibs -fPIC -O2 -c examples/zymbiote/stub/stub.S -o examples/zymbiote/stub/stub.o
+    {{ndk_bin}}\\clang.exe --target=aarch64-linux-android{{android_api}} -nostdlib -nostartfiles -nodefaultlibs -fPIC -O2 -c examples/zymbiote/stub/stub.S -o examples/zymbiote/stub/stub.o
     {{ndk_bin}}\\llvm-objcopy.exe -O binary -j .text examples/zymbiote/stub/stub.o examples/zymbiote/stub/stub.bin
 
 # 编译 zymbiote (Route A, 需先 build agent + stub)
@@ -79,13 +80,17 @@ zymbiote: agent zymbiote-stub
 
 # 推送 zymbiote 到设备
 push-zymbiote: zymbiote
-    -adb shell su -c "pkill xiam-zymbiote" 2>/dev/null
+    -adb shell su -c "pkill xiam-zymbiote" 2>nul
     adb push target/{{android_target}}/release/xiam-zymbiote //sdcard/xiam-zymbiote
     adb shell su -c "cp /sdcard/xiam-zymbiote /data/local/tmp/xiam-zymbiote"
     adb shell su -c "chmod 755 /data/local/tmp/xiam-zymbiote"
     adb shell rm //sdcard/xiam-zymbiote
 
-# 编译 ldmonitor (Android, 需要 bpf-linker)
+# 一键编译 + 推送 + 启动 zymbiote
+zymbiote-deploy: push-zymbiote
+    adb shell su -c /data/local/tmp/xiam-zymbiote
+
+# 编译 ldmonitor
 ldmonitor:
     cargo build -p ldmonitor --target {{android_target}} --release
 
