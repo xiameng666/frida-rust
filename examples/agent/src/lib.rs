@@ -192,8 +192,9 @@ mod android {
     // -----------------------------------------------------------------------
     static SPAWN_BARRIER: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
-    /// 默认超时时间（秒），防止 host 未连接时 app 永久卡死
-    const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 30;
+    /// 默认超时时间（秒），auto-spawn 模式下 host 会立即 loadjs+resume，
+    /// 5s 足够连接完成，防止 MIUI 因主线程阻塞杀进程。
+    const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 5;
 
     /// 读取超时配置（环境变量 FRIDA_RUST_SPAWN_TIMEOUT，默认 30 秒）
     fn spawn_timeout() -> Duration {
@@ -418,7 +419,6 @@ mod android {
             }
         })();
 
-        // 会话结束，清除 event writer
         clear_event_writer();
         result
     }

@@ -57,6 +57,11 @@ inject:
     just deploy
     adb shell su -c /data/local/tmp/xiam-inject
 
+# spawn 模式：auto loadjs + resume（指定 PC 上的 JS 脚本）
+# 用法: just spawn hook.js
+spawn script:
+    cargo run -p agent-host --release -- --spawn {{script}}
+
 # adb 端口转发
 forward:
     adb reverse tcp:12708 tcp:12708
