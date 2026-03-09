@@ -179,4 +179,4 @@ stub_data:
     .quad   0                           /* +0x10: original_func */
     .quad   0                           /* +0x18: slot_addr */
     .word   0                           /* +0x20: uid */
-    .space  108                         /* +0x24: socket_name[108] */
+    .space  32                          /* +0x24: socket_name[32] */

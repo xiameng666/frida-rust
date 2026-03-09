@@ -32,9 +32,9 @@ mod offsets {
     pub const SLOT_ADDR: usize = 0x18;
     pub const UID: usize = 0x20;
     pub const SOCKET_NAME: usize = 0x24;
-    pub const SOCKET_NAME_LEN: usize = 108;
+    pub const SOCKET_NAME_LEN: usize = 32;
     /// Total struct size.
-    pub const STRUCT_SIZE: usize = 0x24 + 108; // 0x90
+    pub const STRUCT_SIZE: usize = 0x24 + 32; // 0x44
 }
 
 /// Parameters for filling the stub data section.

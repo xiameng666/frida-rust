@@ -137,25 +137,44 @@ pub fn get_or_init_engine() -> Result<(), String> {
         static HOOK_INIT: std::sync::Once = std::sync::Once::new();
         HOOK_INIT.call_once(|| {
             const POOL_SIZE: usize = 1024 * 1024; // 1 MB
+
+            // Try RWX first — works on rooted devices and avoids the
+            // problem where /proc/self/mem writes to R-X anonymous pages
+            // are silently rejected by hardened kernels.
             let mem = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
                     POOL_SIZE,
-                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                     -1,
                     0,
                 )
             };
             if mem != libc::MAP_FAILED {
+                // RWX pool — both direct writes and execution work.
                 let _ = init_hook_engine(mem as *mut u8, POOL_SIZE);
-                // Tighten to R-X: hook engine writes to pool via /proc/self/mem
-                unsafe {
-                    libc::mprotect(
-                        mem,
+            } else {
+                // Fallback: RW then tighten to R-X (relies on /proc/self/mem).
+                let mem = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
                         POOL_SIZE,
-                        libc::PROT_READ | libc::PROT_EXEC,
-                    );
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if mem != libc::MAP_FAILED {
+                    let _ = init_hook_engine(mem as *mut u8, POOL_SIZE);
+                    unsafe {
+                        libc::mprotect(
+                            mem,
+                            POOL_SIZE,
+                            libc::PROT_READ | libc::PROT_EXEC,
+                        );
+                    }
                 }
             }
         });

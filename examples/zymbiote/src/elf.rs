@@ -7,6 +7,7 @@ use std::io;
 const ELFMAG: &[u8; 4] = b"\x7fELF";
 const SHT_DYNSYM: u32 = 11;
 const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;
 
 /// ELF64 header (only the fields we need).
 #[repr(C)]
@@ -68,6 +69,66 @@ struct Elf64Phdr {
     p_filesz: u64,
     p_memsz: u64,
     p_align: u64,
+}
+
+/// Information about the executable PT_LOAD segment.
+pub struct ExecLoadInfo {
+    /// p_vaddr of the first PT_LOAD (base vaddr for offset calculations).
+    pub first_load_vaddr: u64,
+    /// p_filesz of the executable PT_LOAD (where real code ends).
+    pub exec_filesz: u64,
+}
+
+/// Parse the ELF at `path` and return info about the executable PT_LOAD segment.
+///
+/// This is used to find the padding area at the end of the text segment:
+/// `code_end = runtime_base + (exec_vaddr - first_load_vaddr) + exec_filesz`.
+/// Bytes from `code_end` to the next page boundary are NUL padding —
+/// safe to overwrite without clobbering real code.
+pub fn exec_load_info(path: &str) -> io::Result<ExecLoadInfo> {
+    let data = fs::read(path)?;
+
+    if data.len() < std::mem::size_of::<Elf64Ehdr>() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small"));
+    }
+    let ehdr = unsafe { &*(data.as_ptr() as *const Elf64Ehdr) };
+    if &ehdr.e_ident[..4] != ELFMAG {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ELF file"));
+    }
+
+    let phdr_base = ehdr.e_phoff as usize;
+    let phdr_size = std::mem::size_of::<Elf64Phdr>();
+
+    let mut first_load_vaddr: Option<u64> = None;
+    let mut exec_filesz: Option<u64> = None;
+
+    for i in 0..ehdr.e_phnum as usize {
+        let off = phdr_base + i * phdr_size;
+        if off + phdr_size > data.len() {
+            break;
+        }
+        let phdr = unsafe { &*(data.as_ptr().add(off) as *const Elf64Phdr) };
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+        if first_load_vaddr.is_none() {
+            first_load_vaddr = Some(phdr.p_vaddr);
+        }
+        if (phdr.p_flags & PF_X) != 0 && exec_filesz.is_none() {
+            exec_filesz = Some(phdr.p_filesz);
+        }
+    }
+
+    match (first_load_vaddr, exec_filesz) {
+        (Some(fv), Some(ef)) => Ok(ExecLoadInfo {
+            first_load_vaddr: fv,
+            exec_filesz: ef,
+        }),
+        _ => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no executable PT_LOAD segment found",
+        )),
+    }
 }
 
 /// Get the file offset of a symbol in an ELF64 shared library.

@@ -198,12 +198,18 @@ impl Injector {
     fn find_addr(&mut self) -> io::Result<()> {
         let regions = proc::parse_maps(self.zpid)?;
         let mut rt_path = String::new();
+        let mut sf_path = String::new();
+        let mut sf_base: usize = 0;
+        let mut sf_end: usize = 0;
 
         for m in &regions {
-            // Find shellcode location: last executable page of libstagefright.so
-            if self.shell == 0 && m.x() && m.path.contains("libstagefright.so") {
-                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-                self.shell = m.end - page_size;
+            // Use the FIRST r-xp mapping of libstagefright.so (the main text segment).
+            // Using the last mapping would be incorrect if there are multiple r-xp
+            // regions (e.g. separate .plt trampoline pages).
+            if sf_path.is_empty() && m.x() && m.path.contains("libstagefright.so") {
+                sf_path = m.path.clone();
+                sf_base = m.start;
+                sf_end = m.end;
             }
 
             // Find libandroid_runtime.so path
@@ -227,12 +233,39 @@ impl Injector {
             }
         }
 
-        if self.shell == 0 || rt_path.is_empty() {
+        if sf_path.is_empty() || rt_path.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "libstagefright.so or libandroid_runtime.so not found in Zygote maps",
             ));
         }
+
+        // ---- Determine shellcode placement ----
+        // Prefer ELF padding (trailing NULs at end of executable segment) so we
+        // don't overwrite real code that other threads might execute.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let payload_len = PAYLOAD.len();
+
+        self.shell = match elf::exec_load_info(&sf_path) {
+            Ok(info) => {
+                let code_end = sf_base + info.exec_filesz as usize;
+                let aligned = (code_end + 15) & !15; // 16-byte align for ARM64
+                let padding = sf_end.saturating_sub(aligned);
+                if padding >= payload_len {
+                    eprintln!("  [+] Using ELF padding ({padding} bytes free)");
+                    aligned
+                } else {
+                    eprintln!(
+                        "  [!] ELF padding too small ({padding} B, need {payload_len}), using last page"
+                    );
+                    sf_end - page_size
+                }
+            }
+            Err(e) => {
+                eprintln!("  [!] ELF parse failed ({e}), using last page");
+                sf_end - page_size
+            }
+        };
 
         // Resolve setArgV0Native address
         let base = proc::base_addr(self.zpid, &rt_path)?;

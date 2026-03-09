@@ -44,19 +44,19 @@ static HookEngine g_engine = {0};
 #define THUNK_ALLOC_SIZE 512
 
 /* --- Pool permission management ---
- * Pool 始终保持 R-X 权限，所有写入通过 /proc/self/mem 完成。
- * /proc/self/maps 中不会出现 rwxp 匿名映射。
- * HookEntry 结构体在堆上分配(malloc)，不占用 R-X pool。
- * pool_make_writable / pool_make_executable 保留为 no-op 以保持调用结构。
+ * Pool is mapped as RWX on rooted devices (simplifies writes).
+ * If SELinux blocks RWX, falls back to R-X with /proc/self/mem writes.
+ * All pool writes go through pool_write() which handles both cases.
+ * HookEntry structs live on the heap (malloc), not in the pool.
  */
 
 static int pool_make_writable(void) {
-    /* Pool 始终 R-X，写入通过 /proc/self/mem */
+    /* Pool may be RWX (no-op) or R-X (no-op; writes go through proc_mem_write) */
     return 0;
 }
 
 static int pool_make_executable(void) {
-    /* Pool 始终 R-X，无需切换 */
+    /* Pool may be RWX (no-op) or already R-X (no-op) */
     return 0;
 }
 
@@ -203,6 +203,19 @@ static int proc_mem_write(void* addr, const void* src, size_t len) {
     return (n == (ssize_t)len) ? 0 : -1;
 }
 
+/*
+ * Write to the hook pool.  Try /proc/self/mem first (works for R-X pools).
+ * If that fails, fall back to direct memcpy (works when pool is RWX).
+ * Returns 0 on success, -1 on total failure.
+ */
+static int pool_write(void* pool_addr, const void* src, size_t len) {
+    if (proc_mem_write(pool_addr, src, len) == 0)
+        return 0;
+    /* Fallback: direct write — safe when pool is mapped RWX */
+    memcpy(pool_addr, src, len);
+    return 0;
+}
+
 /* Write an absolute jump using arm64_writer (MOVZ/MOVK + BR sequence) */
 int hook_write_jump(void* dst, void* target) {
     if (!dst || !target) {
@@ -270,9 +283,9 @@ size_t hook_relocate_instructions_ex(void* src, uint64_t src_base_addr, void* ds
 
     size_t written = arm64_writer_offset(&w);
 
-    /* Copy relocated code to R-X pool via /proc/self/mem */
+    /* Copy relocated code to pool */
     if (written > 0) {
-        proc_mem_write(dst, temp, written);
+        pool_write(dst, temp, written);
     }
 
     arm64_writer_clear(&w);
@@ -305,7 +318,7 @@ int hook_engine_init(void* exec_mem, size_t size) {
     pthread_mutex_init(&g_engine.lock, NULL);
     g_engine.initialized = 1;
 
-    /* Pool is R-X; all writes go through /proc/self/mem */
+    /* Pool permissions are managed by the caller (lib.rs) */
     pool_make_executable();
 
     return 0;
@@ -536,8 +549,8 @@ static void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
 
     *thunk_size_out = arm64_writer_offset(&w);
 
-    /* Copy generated thunk to R-X pool via /proc/self/mem */
-    proc_mem_write(thunk_mem, temp, *thunk_size_out);
+    /* Copy generated thunk to pool */
+    pool_write(thunk_mem, temp, *thunk_size_out);
 
     arm64_writer_clear(&w);
 
@@ -632,7 +645,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
             pthread_mutex_unlock(&g_engine.lock);
             return jump_result;
         }
-        proc_mem_write((uint8_t*)entry->trampoline + relocated_size, jump_temp, jump_result);
+        pool_write((uint8_t*)entry->trampoline + relocated_size, jump_temp, jump_result);
     }
 
     /* Generate thunk code */

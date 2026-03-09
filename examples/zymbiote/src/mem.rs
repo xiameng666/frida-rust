@@ -2,7 +2,7 @@
 
 use crate::proc::MemRegion;
 
-const MAX_REGION_SIZE: usize = 512 * 1024 * 1024; // 512 MB
+const MAX_REGION_SIZE: usize = 64 * 1024 * 1024; // 512 MB
 const CHUNK_SIZE: usize = 256 * 1024; // 256 KB
 
 /// Search a memory region (via an open /proc/<pid>/mem fd) for an 8-byte needle.
