@@ -1,0 +1,12 @@
+[package]
+name = "zymbiote"
+version = "0.1.0"
+edition = "2021"
+description = "XiaM Zymbiote injector — ptrace-free spawn injection via /proc/pid/mem"
+
+[[bin]]
+name = "xiam-zymbiote"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

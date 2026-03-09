@@ -68,6 +68,18 @@ all: agent host injector
     just push-injector
     @echo "all done"
 
+# 编译 zymbiote (旧 injector, Android)
+zymbiote:
+    cargo build -p zymbiote --target {{android_target}} --release
+
+# 推送 zymbiote 到设备
+push-zymbiote: zymbiote
+    -adb shell su -c "pkill xiam-zymbiote" 2>/dev/null
+    adb push target/{{android_target}}/release/xiam-zymbiote //sdcard/xiam-zymbiote
+    adb shell su -c "cp /sdcard/xiam-zymbiote /data/local/tmp/xiam-zymbiote"
+    adb shell su -c "chmod 755 /data/local/tmp/xiam-zymbiote"
+    adb shell rm //sdcard/xiam-zymbiote
+
 # 编译 ldmonitor (Android, 需要 bpf-linker)
 ldmonitor:
     cargo build -p ldmonitor --target {{android_target}} --release
