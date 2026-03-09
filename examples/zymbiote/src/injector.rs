@@ -1,11 +1,19 @@
 //! Core injector: Zymbiote injection via /proc/<pid>/mem.
+//!
+//! Route A: the stub only notifies us via socket; we do the real
+//! injection with ptrace + memfd remote calls.
 
 use crate::elf;
 use crate::mem;
 use crate::payload::{self, StubParams, PAYLOAD};
 use crate::proc::{self, MemRegion};
+use crate::remote_inject;
 use crate::state::InjectState;
 use std::io;
+use std::io::{Read, Write};
+use std::mem::zeroed;
+use std::os::unix::io::FromRawFd;
+use std::thread::{self, JoinHandle};
 
 /// The JNI mangled name of `android.os.Process.setArgV0Native()`.
 /// Every Android app calls this during startup to set its process name.
@@ -18,9 +26,12 @@ const MIN_HEAP_SIZE: usize = 0x10000;
 /// Delay between force-stop and launch (microseconds).
 const LAUNCH_DELAY_US: u32 = 300_000;
 
+/// Abstract socket name for stub → injector notification.
+const NOTIFY_SOCKET: &str = "xiam_zymbiote";
+
 pub struct Injector {
     pkg: String,
-    so_path: String,
+    agent_so: &'static [u8],
 
     zpid: u32,
     uid: u32,
@@ -36,18 +47,19 @@ pub struct Injector {
     orig_slot: [u8; 8],
     orig_code: Vec<u8>,
 
-    // Remote SO path (in target app's cache dir)
-    remote_so: String,
+    // Notification listener
+    listener_fd: i32,                    // dup'd fd for shutdown
+    listener_handle: Option<JoinHandle<()>>,
 
     stopped: bool,
     need_restore: bool,
 }
 
 impl Injector {
-    pub fn new(pkg: &str, so_path: &str) -> Self {
+    pub fn new(pkg: &str, agent_so: &'static [u8]) -> Self {
         Self {
             pkg: pkg.to_string(),
-            so_path: so_path.to_string(),
+            agent_so,
             zpid: 0,
             uid: 0,
             fd: -1,
@@ -57,7 +69,8 @@ impl Injector {
             heaps: Vec::new(),
             orig_slot: [0u8; 8],
             orig_code: Vec::new(),
-            remote_so: String::new(),
+            listener_fd: -1,
+            listener_handle: None,
             stopped: false,
             need_restore: false,
         }
@@ -103,9 +116,12 @@ impl Injector {
             return Err(e);
         }
 
-        // Step 6: Prepare SO file
-        eprintln!("[6] Preparing SO...");
-        self.prep_so()?;
+        // Step 6: Start notification listener
+        eprintln!("[6] Starting notify listener...");
+        let (lfd, lhandle) = start_notify_listener(self.agent_so);
+        self.listener_fd = lfd;
+        self.listener_handle = Some(lhandle);
+        eprintln!("  [+] Listening on @{}", NOTIFY_SOCKET);
 
         // Step 7: Install hook
         eprintln!("[7] Installing hook...");
@@ -119,7 +135,7 @@ impl Injector {
         self.resume();
         self.launch();
 
-        eprintln!("[+] Injection complete! Press Ctrl+C to restore and exit.");
+        eprintln!("[+] Hook installed! Waiting for app to trigger...");
         Ok(())
     }
 
@@ -242,22 +258,6 @@ impl Injector {
         ))
     }
 
-    /// Copy SO to the target app's cache directory so dlopen can load it.
-    fn prep_so(&mut self) -> io::Result<()> {
-        self.remote_so = format!("/data/data/{}/cache/libXiaM_{}.so", self.pkg, self.uid);
-
-        let cmd = format!(
-            "cp '{}' '{}' && chown {}:{} '{}' && chmod 755 '{}'\0",
-            self.so_path, self.remote_so, self.uid, self.uid, self.remote_so, self.remote_so
-        );
-        unsafe {
-            libc::system(cmd.as_ptr() as *const libc::c_char);
-        }
-
-        eprintln!("  [+] SO: {}", self.remote_so);
-        Ok(())
-    }
-
     /// Install the hook: backup originals, fill payload, pwrite to Zygote.
     fn hook(&mut self) -> io::Result<()> {
         let payload_len = PAYLOAD.len();
@@ -294,27 +294,12 @@ impl Injector {
             ));
         }
 
-        // Resolve remote function addresses in Zygote's address space
-        let fn_getuid = elf::remote_sym(self.zpid, "libc.so", "getuid")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("getuid: {e}")))?;
-        let fn_dlopen = elf::remote_sym(self.zpid, "libdl.so", "dlopen")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("dlopen: {e}")))?;
-        let fn_log = elf::remote_sym(self.zpid, "liblog.so", "__android_log_print")
-            .unwrap_or(0); // log is optional
-
-        eprintln!("  [+] getuid: 0x{:x}", fn_getuid);
-        eprintln!("  [+] dlopen: 0x{:x}", fn_dlopen);
-        eprintln!("  [+] log: 0x{:x}", fn_log);
-
         // Fill payload with runtime parameters
         let filled = payload::fill_payload(&StubParams {
             original_func: self.func,
             slot_addr: self.slot,
             uid: self.uid,
-            so_path: self.remote_so.clone(),
-            fn_getuid,
-            fn_dlopen,
-            fn_log,
+            socket_name: NOTIFY_SOCKET.to_string(),
         })
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
@@ -422,9 +407,96 @@ pub fn restore_from_state(state: &InjectState) -> io::Result<()> {
 impl Drop for Injector {
     fn drop(&mut self) {
         self.restore();
+
+        // Shut down the listener socket so the accept-loop thread exits.
+        if self.listener_fd >= 0 {
+            unsafe {
+                libc::shutdown(self.listener_fd, libc::SHUT_RDWR);
+                libc::close(self.listener_fd);
+            }
+            self.listener_fd = -1;
+        }
+        if let Some(handle) = self.listener_handle.take() {
+            let _ = handle.join();
+        }
+
         if self.fd >= 0 {
             unsafe { libc::close(self.fd) };
             self.fd = -1;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Notification listener — accepts PID from stub, runs ptrace+memfd injection
+// ---------------------------------------------------------------------------
+
+/// Start an abstract Unix socket listener for stub notifications.
+///
+/// When a forked child's stub connects and sends its PID, this thread:
+///   1. ptrace attaches to the child
+///   2. Injects the agent via memfd remote calls
+///   3. Signals the stub to continue
+/// Returns `(shutdown_fd, join_handle)`.  The caller keeps `shutdown_fd`
+/// and calls `shutdown()` + `close()` on it to terminate the thread.
+fn start_notify_listener(agent_so: &'static [u8]) -> (i32, JoinHandle<()>) {
+    // Create the listener socket before spawning the thread.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0, "socket() failed");
+
+    let mut addr: libc::sockaddr_un = unsafe { zeroed() };
+    addr.sun_family = libc::AF_UNIX as u16;
+    // Abstract socket: sun_path[0] = 0, name follows.
+    let name = NOTIFY_SOCKET.as_bytes();
+    let len = name.len().min(107);
+    for (i, &b) in name[..len].iter().enumerate() {
+        addr.sun_path[i + 1] = b as libc::c_char;
+    }
+    let addr_len = (std::mem::size_of_val(&addr.sun_family) + 1 + len) as u32;
+
+    let rc = unsafe { libc::bind(fd, &addr as *const _ as *const _, addr_len) };
+    assert!(rc == 0, "bind(@{NOTIFY_SOCKET}) failed: {}", io::Error::last_os_error());
+
+    let rc = unsafe { libc::listen(fd, 4) };
+    assert!(rc == 0, "listen() failed");
+
+    // dup fd so the caller can shutdown() it independently.
+    let shutdown_fd = unsafe { libc::dup(fd) };
+    assert!(shutdown_fd >= 0, "dup() failed");
+
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => {
+                    // Read 4-byte PID from stub.
+                    let mut pid_buf = [0u8; 4];
+                    if stream.read_exact(&mut pid_buf).is_err() {
+                        eprintln!("[!] failed to read PID from stub");
+                        continue;
+                    }
+                    let pid = i32::from_le_bytes(pid_buf);
+                    eprintln!("[*] stub notification: pid={pid}");
+
+                    // Perform ptrace + memfd injection.
+                    match remote_inject::inject_memfd(pid, agent_so) {
+                        Ok(()) => {
+                            eprintln!("[+] injection into pid {pid} succeeded");
+                        }
+                        Err(e) => {
+                            eprintln!("[!] injection into pid {pid} failed: {e}");
+                        }
+                    }
+
+                    // Signal stub to continue (write 1 byte).
+                    let _ = stream.write_all(&[0x01]);
+                }
+                // Listener error (e.g. shutdown from Drop) → exit thread.
+                Err(_) => break,
+            }
+        }
+    });
+
+    (shutdown_fd, handle)
 }

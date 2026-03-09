@@ -68,8 +68,13 @@ all: agent host injector
     just push-injector
     @echo "all done"
 
-# 编译 zymbiote (旧 injector, Android)
-zymbiote:
+# 编译 zymbiote stub (ARM64 shellcode → stub.bin)
+zymbiote-stub:
+    {{ndk_bin}}\\clang.cmd --target=aarch64-linux-android{{android_api}} -nostdlib -nostartfiles -nodefaultlibs -fPIC -O2 -c examples/zymbiote/stub/stub.S -o examples/zymbiote/stub/stub.o
+    {{ndk_bin}}\\llvm-objcopy.exe -O binary -j .text examples/zymbiote/stub/stub.o examples/zymbiote/stub/stub.bin
+
+# 编译 zymbiote (Route A, 需先 build agent + stub)
+zymbiote: agent zymbiote-stub
     cargo build -p zymbiote --target {{android_target}} --release
 
 # 推送 zymbiote 到设备

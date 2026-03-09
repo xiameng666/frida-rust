@@ -1,7 +1,7 @@
 //! XiaM Zymbiote Injector — interactive REPL.
 //!
-//! Run `./xiam-inject`, then type commands:
-//!   start <pkg> [so]  — inject into Zygote
+//! Run `./xiam-zymbiote`, then type commands:
+//!   start <pkg>       — inject into Zygote
 //!   stop              — restore Zygote and clear state
 //!   status            — show current injection info
 //!   exit / quit       — restore (if active) and exit
@@ -11,6 +11,9 @@ mod injector;
 mod mem;
 mod payload;
 mod proc;
+mod ptrace;
+mod remote;
+mod remote_inject;
 mod state;
 
 use std::io::{self, BufRead, Write};
@@ -18,7 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
-const DEFAULT_SO: &str = "/data/local/tmp/libXiaM.so";
+/// Agent SO embedded at compile time.
+static AGENT_SO: &[u8] = include_bytes!("../../../target/aarch64-linux-android/release/libXiaM.so");
 
 fn main() {
     // Check root
@@ -81,7 +85,7 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// start <pkg> [so]
+// start <pkg>
 // ---------------------------------------------------------------------------
 
 fn cmd_start(args: &[&str], inj: &mut Option<injector::Injector>) {
@@ -93,20 +97,12 @@ fn cmd_start(args: &[&str], inj: &mut Option<injector::Injector>) {
     let pkg = match args.get(1) {
         Some(p) => *p,
         None => {
-            eprintln!("Usage: start <pkg> [so_path]");
+            eprintln!("Usage: start <pkg>");
             return;
         }
     };
-    let so_path = args.get(2).copied().unwrap_or(DEFAULT_SO);
 
-    // Verify SO exists
-    let so_c = format!("{}\0", so_path);
-    if unsafe { libc::access(so_c.as_ptr() as *const libc::c_char, libc::R_OK) } != 0 {
-        eprintln!("[!] SO not found: {}", so_path);
-        return;
-    }
-
-    let mut i = injector::Injector::new(pkg, so_path);
+    let mut i = injector::Injector::new(pkg, AGENT_SO);
 
     if let Err(e) = i.run() {
         eprintln!("[!] Injection failed: {}", e);
@@ -182,7 +178,7 @@ fn cmd_status(inj: &Option<injector::Injector>) {
 
 fn cmd_help() {
     eprintln!("Commands:");
-    eprintln!("  start <pkg> [so]   Inject (default SO: {})", DEFAULT_SO);
+    eprintln!("  start <pkg>        Inject (agent SO embedded)");
     eprintln!("  stop               Restore Zygote");
     eprintln!("  status             Show injection state");
     eprintln!("  exit / quit        Restore and exit");

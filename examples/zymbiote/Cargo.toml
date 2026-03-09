@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+nix = { version = "0.29", features = ["ptrace", "signal", "process", "socket", "uio"] }
