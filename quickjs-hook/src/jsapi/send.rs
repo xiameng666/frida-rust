@@ -11,8 +11,23 @@ use crate::value::JSValue;
 use std::ffi::CString;
 use std::sync::Mutex;
 
+/// send() 实时回调类型
+pub type SendCallback = Box<dyn Fn(&str) + Send + 'static>;
+
 /// 全局消息缓冲区
 static SEND_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 全局 send 回调（实时推送）
+static SEND_CALLBACK: Mutex<Option<SendCallback>> = Mutex::new(None);
+
+/// 设置 send() 实时回调
+pub fn set_send_callback<F>(callback: F)
+where
+    F: Fn(&str) + Send + 'static,
+{
+    let mut guard = SEND_CALLBACK.lock().unwrap();
+    *guard = Some(Box::new(callback));
+}
 
 /// 提取并清空消息缓冲区（供 agent 在 loadjs/reloadjs 后调用）
 pub fn drain_send_messages() -> Vec<String> {
@@ -59,7 +74,14 @@ unsafe extern "C" fn js_send(
     ffi::qjs_free_value(ctx, global);
 
     if let Ok(mut buf) = SEND_BUFFER.lock() {
-        buf.push(json_str);
+        buf.push(json_str.clone());
+    }
+
+    // 实时回调
+    if let Ok(guard) = SEND_CALLBACK.lock() {
+        if let Some(callback) = guard.as_ref() {
+            callback(&json_str);
+        }
     }
 
     JSValue::undefined().raw()

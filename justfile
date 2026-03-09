@@ -1,4 +1,4 @@
-# frida-rust justfile
+# XiaM justfile
 
 # Android NDK 配置
 android_target := "aarch64-linux-android"
@@ -14,21 +14,29 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER := ndk_bin + "\\aarch64-linux-a
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android := "--sysroot=" + ndk_sysroot + " -target aarch64-linux-android" + android_api
 export LIBCLANG_PATH := "C:\\Program Files\\LLVM\\bin"
 
-# 编译 agent SO (release, Android)
+# 编译 XiaM SO (release, Android)
 agent:
     cargo build -p agent --target {{android_target}} --release
 
-# 编译 agent-host.exe (Windows)
+# 编译 XiaM-host.exe (Windows)
 host:
     cargo build -p agent-host --release
 
-# 运行 agent-host
+# 运行 XiaM-host
 run:
     cargo run -p agent-host --release
 
-# 推送到设备
+# 推送 SO 到设备（经 /sdcard 中转，解决 fchown 权限问题）
 push: agent
-    adb push target/{{android_target}}/release/libagent.so /data/local/tmp/
+    adb push target/{{android_target}}/release/libXiaM.so //sdcard/libXiaM.so
+    adb shell su -c "cp /sdcard/libXiaM.so /data/local/tmp/libXiaM.so"
+    adb shell su -c "chmod 755 /data/local/tmp/libXiaM.so"
+    adb shell su -c "ls -la /data/local/tmp/libXiaM.so"
+    adb shell rm //sdcard/libXiaM.so
+
+# 部署（push 已包含设权限）
+deploy: push
+    @echo "deployed to /data/local/tmp/libXiaM.so"
 
 # adb 端口转发
 forward:

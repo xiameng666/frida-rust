@@ -14,17 +14,28 @@ use serde_json::json;
 #[cfg(target_os = "android")]
 mod inner {
     use super::*;
+    use agent_protocol::Event;
     use std::sync::Mutex;
 
     /// console 输出缓冲区
     static CONSOLE_OUTPUT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    /// 设置 console 回调，将 JS 的 console.log / warn / error 输出捕获到缓冲区
+    /// 设置 console 回调，同时缓冲（供 loadjs 响应）+ 实时推送 Event
     fn setup_console_callback() {
         quickjs_hook::set_console_callback(|msg: &str| {
+            // 缓冲到 Vec（loadjs/reloadjs 响应会获取）
             if let Ok(mut buf) = CONSOLE_OUTPUT.lock() {
                 buf.push(msg.to_string());
             }
+            // 实时推送到 host
+            crate::android::push_event(&Event::console(msg));
+        });
+    }
+
+    /// 设置 send() 回调，实时推送 send 事件
+    fn setup_send_callback() {
+        quickjs_hook::set_send_callback(|msg: &str| {
+            crate::android::push_event(&Event::send(msg));
         });
     }
 
@@ -38,8 +49,9 @@ mod inner {
 
     /// 处理 jsinit 命令：初始化 QuickJS 引擎
     pub fn handle_jsinit(req: &Request) -> Response {
-        // 先设置 console 回调，确保引擎初始化后日志可捕获
+        // 设置回调，确保引擎初始化后日志和 send 可实时推送
         setup_console_callback();
+        setup_send_callback();
 
         match quickjs_hook::get_or_init_engine() {
             Ok(()) => Response::ok(
@@ -57,6 +69,13 @@ mod inner {
         }
     }
 
+    /// 确保 JS 引擎已初始化（懒加载）
+    fn ensure_engine_ready() -> Result<(), String> {
+        setup_console_callback();
+        setup_send_callback();
+        quickjs_hook::get_or_init_engine()
+    }
+
     /// 处理 loadjs 命令：执行 JS 脚本，返回 console 输出和 send() 消息
     pub fn handle_loadjs(req: &Request) -> Response {
         let script = match req.args.get("script").and_then(|v| v.as_str()) {
@@ -69,6 +88,15 @@ mod inner {
                 );
             }
         };
+
+        // 自动初始化引擎（如果尚未初始化）
+        if let Err(e) = ensure_engine_ready() {
+            return Response::error(
+                &req.id,
+                ErrorCode::Internal,
+                format!("JS 引擎初始化失败: {}", e),
+            );
+        }
 
         // 清空之前的缓冲
         drain_console_output();
@@ -116,6 +144,7 @@ mod inner {
 
         // 重新初始化
         setup_console_callback();
+        setup_send_callback();
         if let Err(e) = quickjs_hook::get_or_init_engine() {
             return Response::error(
                 &req.id,

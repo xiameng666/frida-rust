@@ -1,10 +1,10 @@
-//! Minimal TCP control agent for Android injection.
+//! XiaM - Android instrumentation agent.
 //!
 //! The default workflow is:
 //! 1. Run `adb reverse tcp:12708 tcp:12708`
 //! 2. Start `cargo run -p agent-host`
-//! 3. Inject `libagent.so` into the target Android process
-//! 4. The agent connects back to `127.0.0.1:12708` and enters a structured command loop
+//! 3. Inject `libXiaM.so` into the target Android process
+//! 4. XiaM connects back to `127.0.0.1:12708` and enters a structured command loop
 
 #![cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 
@@ -150,6 +150,12 @@ fn dispatch(req: &Request) -> Response {
         Command::JsInit => js::handle_jsinit(req),
         Command::LoadJs => js::handle_loadjs(req),
         Command::ReloadJs => js::handle_reloadjs(req),
+        Command::Resume => {
+            // 释放 spawn 屏障，让主线程继续执行
+            #[cfg(target_os = "android")]
+            android::signal_resume();
+            Response::ok(&req.id, json!({ "resumed": true }))
+        }
 
         Command::Unknown(ref name) => Response::error(
             &req.id,
@@ -173,18 +179,89 @@ mod android {
     use super::{
         configured_host, configured_port, dispatch, is_exit, reconnect_delay_ms, JNI_VERSION_1_6,
     };
-    use agent_protocol::{frame, Capabilities, Command, Hello, Request};
+    use agent_protocol::{frame, Capabilities, Command, Event, Hello, Request};
     use std::ffi::{c_char, c_void, CString};
     use std::io;
     use std::net::TcpStream;
-    use std::sync::Once;
+    use std::sync::{Arc, Condvar, Mutex, Once};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    // -----------------------------------------------------------------------
+    // Spawn 屏障：init_array 默认阻塞，直到 host 发送 resume
+    // -----------------------------------------------------------------------
+    static SPAWN_BARRIER: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+    /// 默认超时时间（秒），防止 host 未连接时 app 永久卡死
+    const DEFAULT_SPAWN_TIMEOUT_SECS: u64 = 30;
+
+    /// 读取超时配置（环境变量 FRIDA_RUST_SPAWN_TIMEOUT，默认 30 秒）
+    fn spawn_timeout() -> Duration {
+        let secs = std::env::var("FRIDA_RUST_SPAWN_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SPAWN_TIMEOUT_SECS);
+        Duration::from_secs(secs)
+    }
+
+    /// 阻塞当前线程直到 resume 被调用，或超时自动放行
+    /// 返回 true 表示被 resume 唤醒，false 表示超时
+    fn wait_for_resume() -> bool {
+        let (lock, cvar) = &SPAWN_BARRIER;
+        let timeout = spawn_timeout();
+        let mut resumed = lock.lock().unwrap();
+        while !*resumed {
+            let (guard, result) = cvar.wait_timeout(resumed, timeout).unwrap();
+            resumed = guard;
+            if result.timed_out() && !*resumed {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 释放 spawn 屏障（resume 命令触发）
+    pub(super) fn signal_resume() {
+        let (lock, cvar) = &SPAWN_BARRIER;
+        let mut resumed = lock.lock().unwrap();
+        *resumed = true;
+        cvar.notify_all();
+    }
+
+    /// 全局 TCP 写入端，供 hook 回调异步推送 Event
+    static EVENT_WRITER: Mutex<Option<Arc<Mutex<TcpStream>>>> = Mutex::new(None);
+
+    /// 设置全局 event writer（会话开始时调用）
+    fn set_event_writer(writer: Arc<Mutex<TcpStream>>) {
+        if let Ok(mut guard) = EVENT_WRITER.lock() {
+            *guard = Some(writer);
+        }
+    }
+
+    /// 清除全局 event writer（会话结束时调用）
+    fn clear_event_writer() {
+        if let Ok(mut guard) = EVENT_WRITER.lock() {
+            *guard = None;
+        }
+    }
+
+    /// 向 host 推送一个异步事件（从任意线程调用安全）
+    pub fn push_event(event: &Event) {
+        let writer = {
+            let Ok(guard) = EVENT_WRITER.lock() else { return };
+            guard.clone()
+        };
+        if let Some(writer) = writer {
+            if let Ok(mut stream) = writer.lock() {
+                let _ = frame::write_message(&mut *stream, event);
+            }
+        }
+    }
 
     static START_AGENT: Once = Once::new();
 
     const ANDROID_LOG_INFO: i32 = 4;
-    const LOG_TAG: &[u8] = b"frida-rust-agent\0";
+    const LOG_TAG: &[u8] = b"XiaM\0";
     const RETRY_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
     #[link(name = "log")]
@@ -227,10 +304,28 @@ mod android {
 
     fn start_agent(origin: &str) {
         START_AGENT.call_once(|| {
-            android_log_info(&format!("libagent.so loaded via {origin}"));
+            android_log_info(&format!("libXiaM.so loaded via {origin}"));
+
+            // 启动 XiaM 通信线程（后台连接 host）
             let _ = thread::Builder::new()
-                .name("frida-rust-agent".to_string())
+                .name("XiaM".to_string())
                 .spawn(agent_main);
+
+            // 默认阻塞主线程，等待 host 发送 resume 后才让 app 继续执行
+            // 这样 host 可以在 app 运行前注入脚本（hook dlopen 等）
+            let timeout = spawn_timeout();
+            android_log_info(&format!(
+                "blocking main thread, waiting for resume (timeout={}s)...",
+                timeout.as_secs()
+            ));
+            if wait_for_resume() {
+                android_log_info("resumed by host, app continues");
+            } else {
+                android_log_info(&format!(
+                    "spawn timeout ({}s), auto-resuming to prevent app freeze",
+                    timeout.as_secs()
+                ));
+            }
         });
     }
 
@@ -250,7 +345,7 @@ mod android {
 
                     if let Err(error) = handle_session(stream) {
                         android_log_info(&format!("session ended: {error}; reconnecting"));
-                        eprintln!("agent session error: {error}");
+                        eprintln!("XiaM session error: {error}");
                     } else {
                         android_log_info("connection closed by host; reconnecting");
                     }
@@ -270,7 +365,7 @@ mod android {
                         last_retry_log = Some(Instant::now());
                     }
 
-                    eprintln!("agent connect error to {host}:{port}: {error}");
+                    eprintln!("XiaM connect error to {host}:{port}: {error}");
                 }
             }
 
@@ -285,28 +380,47 @@ mod android {
     }
 
     /// 处理一个 TCP 会话：发送 Hello 握手，然后进入请求/响应循环。
-    fn handle_session(mut stream: TcpStream) -> io::Result<()> {
-        // 发送结构化 Hello 握手
-        let hello = Hello::new(
+    fn handle_session(stream: TcpStream) -> io::Result<()> {
+        // try_clone 得到写端，读端用原始 stream
+        let writer = Arc::new(Mutex::new(stream.try_clone()?));
+        let mut reader = stream;
+
+        // 设置全局 event writer，供 hook 回调异步推送
+        set_event_writer(writer.clone());
+
+        // 发送结构化 Hello 握手（始终 spawn=true）
+        let hello = Hello::new_spawn(
             std::process::id(),
             Capabilities::from_commands(Command::supported_commands()),
         );
-        frame::write_message(&mut stream, &hello)?;
+        {
+            let mut w = writer.lock().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            frame::write_message(&mut *w, &hello)?;
+        }
 
         // 请求/响应循环
-        loop {
-            let Some(req) = frame::read_message::<_, Request>(&mut stream)? else {
-                return Ok(());
-            };
+        let result = (|| -> io::Result<()> {
+            loop {
+                let Some(req) = frame::read_message::<_, Request>(&mut reader)? else {
+                    return Ok(());
+                };
 
-            let should_exit = is_exit(&req);
-            let resp = dispatch(&req);
-            frame::write_message(&mut stream, &resp)?;
+                let should_exit = is_exit(&req);
+                let resp = dispatch(&req);
+                {
+                    let mut w = writer.lock().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    frame::write_message(&mut *w, &resp)?;
+                }
 
-            if should_exit {
-                return Ok(());
+                if should_exit {
+                    return Ok(());
+                }
             }
-        }
+        })();
+
+        // 会话结束，清除 event writer
+        clear_event_writer();
+        result
     }
 }
 

@@ -11,6 +11,6 @@ pub mod message;
 
 pub use frame::{read_frame, write_frame};
 pub use message::{
-    Capabilities, Command, ErrorCode, Hello, HostMode, Request, Response, Status,
+    Capabilities, Command, ErrorCode, Event, Hello, HostMode, Request, Response, Status,
     PROTOCOL_VERSION,
 };

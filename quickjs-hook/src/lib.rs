@@ -37,7 +37,7 @@ pub use value::JSValue;
 pub use jsapi::console::set_console_callback;
 pub use jsapi::hook_api::cleanup_hooks;
 pub use jsapi::interceptor::cleanup_interceptor_hooks;
-pub use jsapi::send::drain_send_messages;
+pub use jsapi::send::{drain_send_messages, set_send_callback};
 
 use std::sync::Mutex;
 

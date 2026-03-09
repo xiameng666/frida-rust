@@ -24,6 +24,20 @@ use std::sync::Mutex;
 
 // hook_engine 错误码
 const HOOK_OK: i32 = 0;
+const HOOK_ERROR_NOT_INITIALIZED: i32 = -1;
+const HOOK_ERROR_ALREADY_HOOKED: i32 = -3;
+const HOOK_ERROR_ALLOC_FAILED: i32 = -4;
+const HOOK_ERROR_MPROTECT_FAILED: i32 = -5;
+
+fn hook_error_msg(code: i32) -> &'static [u8] {
+    match code {
+        HOOK_ERROR_NOT_INITIALIZED => b"hook engine not initialized\0",
+        HOOK_ERROR_ALREADY_HOOKED => b"address already hooked\0",
+        HOOK_ERROR_ALLOC_FAILED => b"memory allocation failed\0",
+        HOOK_ERROR_MPROTECT_FAILED => b"mprotect failed\0",
+        _ => b"hook_attach failed\0",
+    }
+}
 
 /// 存储 Interceptor hook 的回调数据
 struct InterceptorHook {
@@ -282,7 +296,7 @@ unsafe extern "C" fn js_interceptor_attach(
         }
         return ffi::JS_ThrowInternalError(
             ctx,
-            b"Interceptor.attach failed\0".as_ptr() as *const _,
+            hook_error_msg(result).as_ptr() as *const _,
         );
     }
 

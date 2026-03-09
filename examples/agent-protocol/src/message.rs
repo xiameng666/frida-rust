@@ -23,6 +23,9 @@ pub struct Hello {
     pub transport: String,
     /// Agent 支持的能力列表
     pub capabilities: Capabilities,
+    /// 是否处于 spawn 模式（主线程阻塞等待 resume）
+    #[serde(default)]
+    pub spawn: bool,
 }
 
 impl Hello {
@@ -33,6 +36,18 @@ impl Hello {
             pid,
             transport: "tcp".to_string(),
             capabilities,
+            spawn: false,
+        }
+    }
+
+    /// 创建 spawn 模式的 Hello
+    pub fn new_spawn(pid: u32, capabilities: Capabilities) -> Self {
+        Self {
+            version: PROTOCOL_VERSION.to_string(),
+            pid,
+            transport: "tcp".to_string(),
+            capabilities,
+            spawn: true,
         }
     }
 }
@@ -72,6 +87,7 @@ pub enum Command {
     JsInit,
     LoadJs,
     ReloadJs,
+    Resume,
     Echo,
     Exit,
     Help,
@@ -94,6 +110,7 @@ impl Command {
             "jsinit" => Self::JsInit,
             "loadjs" => Self::LoadJs,
             "reloadjs" => Self::ReloadJs,
+            "resume" => Self::Resume,
             "echo" => Self::Echo,
             "exit" | "quit" => Self::Exit,
             "help" => Self::Help,
@@ -115,6 +132,7 @@ impl Command {
             Self::JsInit => "jsinit",
             Self::LoadJs => "loadjs",
             Self::ReloadJs => "reloadjs",
+            Self::Resume => "resume",
             Self::Echo => "echo",
             Self::Exit => "exit",
             Self::Help => "help",
@@ -140,6 +158,7 @@ impl Command {
             "jsinit",
             "loadjs",
             "reloadjs",
+            "resume",
         ]
     }
 }
@@ -264,6 +283,42 @@ impl Response {
             data: None,
             error_code: Some(code),
             error_message: Some(message.into()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event (agent -> host, 异步推送)
+// ---------------------------------------------------------------------------
+
+/// Agent 主动推送的事件消息（不需要请求触发）。
+/// 用于 hook 回调的 console.log / send() 实时输出。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    /// 事件类型标识，固定为 "event"
+    pub event: String,
+    /// 事件子类型: "console", "send"
+    pub event_type: String,
+    /// 事件数据
+    pub payload: Value,
+}
+
+impl Event {
+    /// 创建 console 事件
+    pub fn console(message: impl Into<String>) -> Self {
+        Self {
+            event: "event".to_string(),
+            event_type: "console".to_string(),
+            payload: Value::String(message.into()),
+        }
+    }
+
+    /// 创建 send 事件
+    pub fn send(message: impl Into<String>) -> Self {
+        Self {
+            event: "event".to_string(),
+            event_type: "send".to_string(),
+            payload: Value::String(message.into()),
         }
     }
 }

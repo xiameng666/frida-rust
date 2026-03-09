@@ -13,6 +13,8 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 
 /* wxshadow prctl operations - shadow page patching */
 #ifndef PR_WXSHADOW_PATCH
@@ -40,18 +42,21 @@ static HookEngine g_engine = {0};
 #define TRAMPOLINE_ALLOC_SIZE 256
 #define THUNK_ALLOC_SIZE 512
 
-/* --- Pool permission management (Fix 2: RWX → R-X) --- */
+/* --- Pool permission management ---
+ * 当前策略：保持 RWX 不切换。
+ * SELinux 在现代 Android 上会阻止 R-X → RWX 的 mprotect，
+ * 导致 hook_attach 失败。初始 mmap(RWX) 成功后不再变更权限。
+ * TODO: 后续用 /proc/self/mem 写入实现真正 W^X 隐身。
+ */
 
 static int pool_make_writable(void) {
-    if (!g_engine.exec_mem) return -1;
-    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
-                    PROT_READ | PROT_WRITE | PROT_EXEC);
+    /* RWX 池不需要切换 */
+    return 0;
 }
 
 static int pool_make_executable(void) {
-    if (!g_engine.exec_mem) return -1;
-    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
-                    PROT_READ | PROT_EXEC);
+    /* RWX 池不需要切换 */
+    return 0;
 }
 
 /* --- Entry free list management (Fix 4: memory reuse) --- */
@@ -169,6 +174,34 @@ static int wxshadow_release(void* addr, size_t len) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * /proc/self/mem helpers — bypass SELinux mprotect restrictions
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * Read `len` bytes from virtual address `addr` via /proc/self/mem.
+ * Returns 0 on success, -1 on failure.
+ */
+static int proc_mem_read(void* dst, const void* addr, size_t len) {
+    int fd = open("/proc/self/mem", O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = pread(fd, dst, len, (off_t)(uintptr_t)addr);
+    close(fd);
+    return (n == (ssize_t)len) ? 0 : -1;
+}
+
+/*
+ * Write `len` bytes to virtual address `addr` via /proc/self/mem.
+ * Returns 0 on success, -1 on failure.
+ */
+static int proc_mem_write(void* addr, const void* src, size_t len) {
+    int fd = open("/proc/self/mem", O_WRONLY);
+    if (fd < 0) return -1;
+    ssize_t n = pwrite(fd, src, len, (off_t)(uintptr_t)addr);
+    close(fd);
+    return (n == (ssize_t)len) ? 0 : -1;
+}
+
 /* Write an absolute jump using arm64_writer (MOVZ/MOVK + BR sequence) */
 int hook_write_jump(void* dst, void* target) {
     if (!dst || !target) {
@@ -211,13 +244,16 @@ void* hook_alloc(size_t size) {
     return ptr;
 }
 
-/* Relocate instructions from src to dst using arm64_relocator */
-size_t hook_relocate_instructions(void* src, void* dst, size_t min_bytes) {
+/* Relocate instructions from src to dst using arm64_relocator.
+ * src_base_addr is the original PC address for PC-relative relocation
+ * (may differ from src when reading from a saved copy).
+ */
+size_t hook_relocate_instructions_ex(void* src, uint64_t src_base_addr, void* dst, size_t min_bytes) {
     Arm64Writer w;
     Arm64Relocator r;
 
     arm64_writer_init(&w, dst, (uint64_t)dst, 256);
-    arm64_relocator_init(&r, src, (uint64_t)src, &w);
+    arm64_relocator_init(&r, src, src_base_addr, &w);
 
     size_t src_offset = 0;
     while (src_offset < min_bytes) {
@@ -234,6 +270,11 @@ size_t hook_relocate_instructions(void* src, void* dst, size_t min_bytes) {
     arm64_relocator_clear(&r);
 
     return written;
+}
+
+/* Convenience wrapper: src address is also the base address */
+size_t hook_relocate_instructions(void* src, void* dst, size_t min_bytes) {
+    return hook_relocate_instructions_ex(src, (uint64_t)src, dst, min_bytes);
 }
 
 /* Initialize the hook engine */
@@ -302,6 +343,17 @@ void* hook_install(void* target, void* replacement, int stealth) {
     entry->target = target;
     entry->replacement = replacement;
 
+    /* Make target page readable+writable FIRST (execute-only pages) */
+    uintptr_t target_page = (uintptr_t)target & ~0xFFF;
+    if (!stealth) {
+        if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            free_entry(entry);
+            pool_make_executable();
+            pthread_mutex_unlock(&g_engine.lock);
+            return NULL;
+        }
+    }
+
     /* Allocate trampoline space (reuse if available and large enough) */
     if (!entry->trampoline || entry->trampoline_alloc < TRAMPOLINE_ALLOC_SIZE) {
         entry->trampoline = hook_alloc(TRAMPOLINE_ALLOC_SIZE);
@@ -314,7 +366,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
         return NULL;
     }
 
-    /* Save original bytes */
+    /* Save original bytes (target page is now readable) */
     memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
     entry->original_size = MIN_HOOK_SIZE;
 
@@ -354,13 +406,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
         }
         entry->stealth = 1;
     } else {
-        /* Normal mode: mprotect + direct write */
-        uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-        if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return NULL;
-        }
+        /* Normal mode: target page already RWX from above */
         jump_result = hook_write_jump(target, replacement);
         if (jump_result < 0) {
             free_entry(entry);
@@ -521,8 +567,21 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     entry->on_leave = on_leave;
     entry->user_data = user_data;
 
-    /* Save original bytes */
-    memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
+    /*
+     * Read original bytes via /proc/self/mem (works even on execute-only pages).
+     * Falls back to direct memcpy if /proc/self/mem fails.
+     */
+    if (proc_mem_read(entry->original_bytes, target, MIN_HOOK_SIZE) != 0) {
+        /* Fallback: try mprotect + direct read */
+        uintptr_t target_page = (uintptr_t)target & ~0xFFF;
+        if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            free_entry(entry);
+            pool_make_executable();
+            pthread_mutex_unlock(&g_engine.lock);
+            return HOOK_ERROR_MPROTECT_FAILED;
+        }
+        memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
+    }
     entry->original_size = MIN_HOOK_SIZE;
 
     /* Allocate trampoline (reuse if available and large enough) */
@@ -537,8 +596,12 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         return HOOK_ERROR_ALLOC_FAILED;
     }
 
-    /* Relocate original instructions to trampoline */
-    size_t relocated_size = hook_relocate_instructions(target, entry->trampoline, MIN_HOOK_SIZE);
+    /* Relocate original instructions to trampoline.
+     * Read from saved copy (original_bytes) but use target as PC base address
+     * for correct PC-relative relocation.
+     */
+    size_t relocated_size = hook_relocate_instructions_ex(
+        entry->original_bytes, (uint64_t)target, entry->trampoline, MIN_HOOK_SIZE);
 
     /* Write jump back to original code after the hook */
     void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
@@ -563,8 +626,11 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     /* Tighten pool back to R-X before patching target */
     pool_make_executable();
 
-    if (stealth) {
-        /* Stealth mode: write jump to temp buffer, patch via wxshadow */
+    /* Patch target: write jump to thunk.
+     * Try /proc/self/mem first (no mprotect needed), then mprotect fallback,
+     * then wxshadow for stealth mode.
+     */
+    {
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, thunk_mem);
         if (jump_result < 0) {
@@ -572,30 +638,41 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
             pthread_mutex_unlock(&g_engine.lock);
             return jump_result;
         }
+        /* Pad remaining bytes with BRK */
         for (int i = jump_result; i < MIN_HOOK_SIZE; i += 4) {
-            *(uint32_t*)(jump_buf + i) = 0xD4200000 | (0xFFFF << 5); /* BRK #0xFFFF */
+            *(uint32_t*)(jump_buf + i) = 0xD4200000 | (0xFFFF << 5);
         }
-        if (wxshadow_patch(target, jump_buf, MIN_HOOK_SIZE) != 0) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return HOOK_ERROR_WXSHADOW_FAILED;
+
+        int patched = 0;
+
+        if (stealth) {
+            /* Stealth: wxshadow */
+            if (wxshadow_patch(target, jump_buf, MIN_HOOK_SIZE) == 0) {
+                entry->stealth = 1;
+                patched = 1;
+            }
         }
-        entry->stealth = 1;
-    } else {
-        /* Normal mode: mprotect + direct write (Fix 1: 0x2000 for cross-page) */
-        uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-        if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return HOOK_ERROR_MPROTECT_FAILED;
+
+        if (!patched) {
+            /* Try /proc/self/mem write (bypasses SELinux mprotect block) */
+            if (proc_mem_write(target, jump_buf, MIN_HOOK_SIZE) == 0) {
+                entry->stealth = 0;
+                patched = 1;
+            }
         }
-        jump_result = hook_write_jump(target, thunk_mem);
-        if (jump_result < 0) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return jump_result;
+
+        if (!patched) {
+            /* Last resort: mprotect + direct write */
+            uintptr_t target_page = (uintptr_t)target & ~0xFFF;
+            if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                free_entry(entry);
+                pthread_mutex_unlock(&g_engine.lock);
+                return HOOK_ERROR_MPROTECT_FAILED;
+            }
+            memcpy(target, jump_buf, MIN_HOOK_SIZE);
+            entry->stealth = 0;
+            patched = 1;
         }
-        entry->stealth = 0;
     }
 
     /* Flush caches */
@@ -636,13 +713,15 @@ int hook_remove(void* target) {
                     return HOOK_ERROR_WXSHADOW_FAILED;
                 }
             } else {
-                /* Normal hook: restore original bytes via mprotect + memcpy */
-                uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-                if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                    pthread_mutex_unlock(&g_engine.lock);
-                    return HOOK_ERROR_MPROTECT_FAILED;
+                /* Normal hook: restore original bytes via /proc/self/mem or mprotect */
+                if (proc_mem_write(target, entry->original_bytes, entry->original_size) != 0) {
+                    uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+                    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                        pthread_mutex_unlock(&g_engine.lock);
+                        return HOOK_ERROR_MPROTECT_FAILED;
+                    }
+                    memcpy(target, entry->original_bytes, entry->original_size);
                 }
-                memcpy(target, entry->original_bytes, entry->original_size);
             }
             hook_flush_cache(target, entry->original_size);
 
@@ -691,9 +770,11 @@ void hook_engine_cleanup(void) {
         if (entry->stealth) {
             wxshadow_release(entry->target, entry->original_size);
         } else {
-            uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
-            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
-            memcpy(entry->target, entry->original_bytes, entry->original_size);
+            if (proc_mem_write(entry->target, entry->original_bytes, entry->original_size) != 0) {
+                uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
+                mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+                memcpy(entry->target, entry->original_bytes, entry->original_size);
+            }
         }
         hook_flush_cache(entry->target, entry->original_size);
         entry = entry->next;
