@@ -42,6 +42,7 @@ pub struct Injector {
     func: usize,             // setArgV0Native runtime address
     slot: usize,             // ArtMethod entry_point field address
     heaps: Vec<MemRegion>,   // candidate boot heap regions
+    all_rw: Vec<MemRegion>,  // all rw regions (fallback search)
 
     // Backup for restore
     orig_slot: [u8; 8],
@@ -67,6 +68,7 @@ impl Injector {
             func: 0,
             slot: 0,
             heaps: Vec::new(),
+            all_rw: Vec::new(),
             orig_slot: [0u8; 8],
             orig_code: Vec::new(),
             listener_fd: -1,
@@ -209,7 +211,7 @@ impl Injector {
                 rt_path = m.path.clone();
             }
 
-            // Collect boot heap candidate regions
+            // Collect rw regions for ArtMethod search
             if m.rw() {
                 let is_heap = m.path.contains("boot.art")
                     || m.path.contains("boot-framework.art")
@@ -221,6 +223,7 @@ impl Injector {
                 if is_heap {
                     self.heaps.push(m.clone());
                 }
+                self.all_rw.push(m.clone());
             }
         }
 
@@ -242,9 +245,10 @@ impl Injector {
         Ok(())
     }
 
-    /// Search boot heap regions for the ArtMethod entry_point slot
-    /// that contains the setArgV0Native address.
+    /// Search for the ArtMethod entry that contains the setArgV0Native address.
+    /// Tries boot heap regions first, then falls back to all rw regions.
     fn find_slot(&mut self) -> io::Result<()> {
+        // Fast path: boot heap regions
         for h in &self.heaps {
             if let Some(addr) = mem::search(self.fd, h, self.func) {
                 self.slot = addr;
@@ -252,9 +256,28 @@ impl Injector {
                 return Ok(());
             }
         }
+
+        // Fallback: search ALL rw regions (covers newer Android where
+        // ArtMethod lives in [anon:*] tagged regions not matching boot heap filters)
+        eprintln!("  [*] Not in boot heap ({} regions), searching all rw ({} regions)...",
+            self.heaps.len(), self.all_rw.len());
+
+        for m in &self.all_rw {
+            // Skip regions already searched
+            if self.heaps.iter().any(|h| h.start == m.start) {
+                continue;
+            }
+            if let Some(addr) = mem::search(self.fd, m, self.func) {
+                self.slot = addr;
+                eprintln!("  [+] ArtMethod slot: 0x{:x} (in {:?})", self.slot,
+                    if m.path.is_empty() { "<anon>" } else { &m.path });
+                return Ok(());
+            }
+        }
+
         Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "ArtMethod slot not found in boot heap",
+            "ArtMethod slot not found in any rw region",
         ))
     }
 
