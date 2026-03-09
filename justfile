@@ -62,6 +62,23 @@ inject:
 spawn script:
     cargo run -p agent-host --release -- --spawn {{script}}
 
+# 编译全部 + 推送 agent/injector 到设备
+all: agent host injector
+    just push
+    just push-injector
+    @echo "all done"
+
+# 编译 ldmonitor (Android, 需要 bpf-linker)
+ldmonitor:
+    cargo build -p ldmonitor --target {{android_target}} --release
+
+# 推送 ldmonitor 到设备
+push-ldmonitor: ldmonitor
+    adb push target/{{android_target}}/release/ldmonitor //sdcard/ldmonitor
+    adb shell su -c "cp /sdcard/ldmonitor /data/local/tmp/ldmonitor"
+    adb shell su -c "chmod 755 /data/local/tmp/ldmonitor"
+    adb shell rm //sdcard/ldmonitor
+
 # adb 端口转发
 forward:
     adb reverse tcp:12708 tcp:12708

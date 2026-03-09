@@ -30,6 +30,9 @@
       <sourceFolder url="file://$MODULE_DIR$/examples/agent/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/examples/agent-protocol/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/examples/injector/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/ldmonitor-common/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/ldmonitor-ebpf/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/ldmonitor/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

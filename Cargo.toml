@@ -11,6 +11,9 @@ members = [
     "examples/agent",
     "examples/agent-host",
     "examples/injector",
+    "ldmonitor",
+    "ldmonitor-common",
+    "ldmonitor-ebpf",
 ]
 exclude = ["quickjs-hook"]
 # We miss our linux_no_std example from the default members since `cargo check`
@@ -27,3 +30,18 @@ edition = "2021"
 license = "wxWindows"
 repository = "https://github.com/frida/frida-rust"
 description = "Rust bindings for Frida"
+
+[workspace.dependencies]
+anyhow = "1"
+aya = "0.13"
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+aya-build = "0.1"
+bytes = "1"
+cargo_metadata = "0.19"
+clap = "4"
+env_logger = "0.11"
+libc = "0.2"
+log = "0.4"
+tokio = "1"
+which = "7"
