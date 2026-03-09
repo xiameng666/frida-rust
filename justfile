@@ -55,7 +55,19 @@ push-injector: injector
 inject pkg so="/data/local/tmp/libXiaM.so":
     just push-injector
     just deploy
-    adb shell su -c "/data/local/tmp/xiam-inject '{{pkg}}' '{{so}}'"
+    adb shell su -c "/data/local/tmp/xiam-inject start '{{pkg}}' '{{so}}'"
+
+# 停止注入并恢复 Zygote
+stop:
+    adb shell su -c "/data/local/tmp/xiam-inject stop"
+
+# 查看注入状态
+status:
+    adb shell su -c "/data/local/tmp/xiam-inject status"
+
+# 强制恢复 Zygote（daemon 已死时使用）
+restore:
+    adb shell su -c "/data/local/tmp/xiam-inject restore"
 
 # adb 端口转发
 forward:

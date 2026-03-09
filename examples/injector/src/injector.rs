@@ -4,6 +4,7 @@ use crate::elf;
 use crate::mem;
 use crate::payload::{self, StubParams, PAYLOAD};
 use crate::proc::{self, MemRegion};
+use crate::state::InjectState;
 use std::io;
 
 /// The JNI mangled name of `android.os.Process.setArgV0Native()`.
@@ -120,6 +121,25 @@ impl Injector {
 
         eprintln!("[+] Injection complete! Press Ctrl+C to restore and exit.");
         Ok(())
+    }
+
+    /// Snapshot current injection state for persistence.
+    pub fn to_state(&self) -> InjectState {
+        InjectState {
+            daemon_pid: std::process::id(),
+            zpid: self.zpid,
+            slot: self.slot,
+            shell: self.shell,
+            orig_slot: self.orig_slot,
+            orig_code: self.orig_code.clone(),
+            pkg: self.pkg.clone(),
+        }
+    }
+
+    /// Disarm the Drop guard so the hook stays active
+    /// (used when the daemon wants to keep running without restoring on drop).
+    pub fn disarm(&mut self) {
+        self.need_restore = false;
     }
 
     /// Restore Zygote to its original state.
@@ -365,6 +385,44 @@ impl Injector {
 
         eprintln!("  [+] App launched");
     }
+}
+
+/// Standalone restore from a persisted state — works without an Injector instance.
+/// Opens `/proc/<zpid>/mem` itself, so the original fd is not required.
+pub fn restore_from_state(state: &InjectState) -> io::Result<()> {
+    eprintln!("[*] Restoring Zygote (pid {}) from state...", state.zpid);
+
+    let mem_path = format!("/proc/{}/mem\0", state.zpid);
+    let fd = unsafe { libc::open(mem_path.as_ptr() as *const libc::c_char, libc::O_RDWR) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    unsafe {
+        libc::kill(state.zpid as i32, libc::SIGSTOP);
+
+        libc::pwrite(
+            fd,
+            state.orig_slot.as_ptr() as *const libc::c_void,
+            8,
+            state.slot as libc::off_t,
+        );
+
+        if !state.orig_code.is_empty() {
+            libc::pwrite(
+                fd,
+                state.orig_code.as_ptr() as *const libc::c_void,
+                state.orig_code.len(),
+                state.shell as libc::off_t,
+            );
+        }
+
+        libc::kill(state.zpid as i32, libc::SIGCONT);
+        libc::close(fd);
+    }
+
+    eprintln!("[+] Zygote restored");
+    Ok(())
 }
 
 impl Drop for Injector {
