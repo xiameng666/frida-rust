@@ -49,11 +49,12 @@ fn main() {
         vec![]
     };
 
-    // Compile hook_engine.c
+    // Compile hook_engine.c + so_hide.c
     cc::Build::new()
         .file(src_path.join("hook_engine.c"))
         .file(src_path.join("arm64_writer.c"))
         .file(src_path.join("arm64_relocator.c"))
+        .file(src_path.join("so_hide.c"))
         .include(&src_path)
         .opt_level(2)
         .flag("-fPIC")
@@ -130,11 +131,12 @@ fn main() {
         println!("cargo:warning=Run: cd quickjs-hook && ./setup_quickjs.sh");
     }
 
-    // Generate bindings for hook_engine (includes arm64_writer and arm64_relocator)
+    // Generate bindings for hook_engine + so_hide (includes arm64_writer and arm64_relocator)
     let mut hook_builder = bindgen::Builder::default()
         .header(src_path.join("hook_engine.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_writer.h").to_string_lossy().to_string())
         .header(src_path.join("arm64_relocator.h").to_string_lossy().to_string())
+        .header(src_path.join("so_hide.h").to_string_lossy().to_string())
         .clang_arg(format!("-I{}", src_path.display()))
         .clang_arg("-xc");
     for arg in &android_clang_args {
@@ -148,9 +150,11 @@ fn main() {
         .allowlist_function("hook_.*")
         .allowlist_function("arm64_writer_.*")
         .allowlist_function("arm64_relocator_.*")
+        .allowlist_function("so_hide_.*")
         .allowlist_type("Hook.*")
         .allowlist_type("Arm64.*")
         .allowlist_var("ARM64_.*")
+        .allowlist_var("SO_HIDE_.*")
         .use_core()
         .generate()
         .expect("Unable to generate hook_engine bindings");
@@ -165,6 +169,8 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=src/hook_engine.c");
     println!("cargo:rerun-if-changed=src/hook_engine.h");
+    println!("cargo:rerun-if-changed=src/so_hide.c");
+    println!("cargo:rerun-if-changed=src/so_hide.h");
     println!("cargo:rerun-if-changed=src/arm64_writer.c");
     println!("cargo:rerun-if-changed=src/arm64_writer.h");
     println!("cargo:rerun-if-changed=src/arm64_relocator.c");
