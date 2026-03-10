@@ -36,7 +36,7 @@ int so_hide_init(int server_fd);
 /*
  * Hide a loaded SO by name (substring match).
  *
- * @param so_name  Substring to match in SO path (e.g. "xm-jit-cache")
+ * @param so_name  Substring to match in SO path (e.g. "xiam")
  * @return         Bitmask of SO_HIDE_* flags, or negative on error
  */
 int so_hide_execute(const char* so_name);

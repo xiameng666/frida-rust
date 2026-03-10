@@ -218,8 +218,8 @@ static int target_write(void* addr, const void* buf, size_t len) {
 #define TRAMPOLINE_ALLOC_SIZE 256
 #define THUNK_ALLOC_SIZE 512
 
-/* --- Pool permission management ---
- * Two write strategies (in priority order):
+/* --- Pool write management ---
+ * Write strategies (in priority order):
  *   1. Dual-mapping (exec_mem_rw != NULL) â†?hook_memcpy to RW view, zero RWX ever
  *   2. raw_mprotect toggle: R-X â†?RWX â†?write â†?R-X
  * HookEntry structs live on the heap (malloc), not in the pool.
@@ -227,16 +227,14 @@ static int target_write(void* addr, const void* buf, size_t len) {
 
 static int pool_make_writable(void) {
     if (!g_engine.exec_mem) return -1;
-    if (g_engine.exec_mem_rw) return 0;   /* dual-mapping: RW view always writable */
-    return raw_mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
-                    PROT_READ | PROT_WRITE | PROT_EXEC);
+    /* No-op: pool_write handles writes via server pwrite internally */
+    return 0;
 }
 
 static int pool_make_executable(void) {
     if (!g_engine.exec_mem) return -1;
-    if (g_engine.exec_mem_rw) return 0;   /* dual-mapping: R-X view always executable */
-    return raw_mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
-                    PROT_READ | PROT_EXEC);
+    /* No-op: pool is always R-X; writes go through server pwrite */
+    return 0;
 }
 
 /* --- Entry free list management (Fix 4: memory reuse) --- */
@@ -360,15 +358,19 @@ static int wxshadow_release(void* addr, size_t len) {
  *   2. Fallback: direct hook_memcpy (caller made pool RWX via pool_make_writable)
  */
 static int pool_write(void* pool_addr, const void* src, size_t len) {
-    /* Strategy 1: dual-mapping â€?translate to RW view */
-    if (g_engine.exec_mem_rw) {
-        size_t offset = (uint8_t*)pool_addr - (uint8_t*)g_engine.exec_mem;
-        hook_memcpy((uint8_t*)g_engine.exec_mem_rw + offset, src, len);
+    /* Strategy 1: server pwrite (zero mprotect, zero RWX) */
+    if (g_engine.server_fd >= 0) {
+        return target_write(pool_addr, src, len);
+    }
+    /* Strategy 2: mprotect toggle fallback */
+    if (raw_mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+        hook_memcpy(pool_addr, src, len);
+        raw_mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
+                     PROT_READ | PROT_EXEC);
         return 0;
     }
-    /* Strategy 2: direct hook_memcpy (pool is temporarily RWX) */
-    hook_memcpy(pool_addr, src, len);
-    return 0;
+    return -1;
 }
 
 /* Write an absolute jump using arm64_writer (MOVZ/MOVK + BR sequence) */
@@ -455,7 +457,7 @@ size_t hook_relocate_instructions(void* src, void* dst, size_t min_bytes) {
 }
 
 /* Initialize the hook engine */
-int hook_engine_init(void* exec_mem, void* rw_mem, size_t size) {
+int hook_engine_init(void* exec_mem, size_t size) {
     if (g_engine.initialized) {
         return 0; /* Already initialized */
     }
@@ -465,7 +467,6 @@ int hook_engine_init(void* exec_mem, void* rw_mem, size_t size) {
     }
 
     g_engine.exec_mem = exec_mem;
-    g_engine.exec_mem_rw = rw_mem;  /* NULL if not using dual-mapping */
     g_engine.exec_mem_size = size;
     g_engine.exec_mem_used = 0;
     g_engine.hooks = NULL;
@@ -475,12 +476,7 @@ int hook_engine_init(void* exec_mem, void* rw_mem, size_t size) {
     g_engine.server_fd = -1;
     g_engine.initialized = 1;
 
-    if (rw_mem) {
-        HOOK_LOGI("pool: dual-mapping active (rx=%p rw=%p %zuKB) â€?zero RWX",
-                  exec_mem, rw_mem, size / 1024);
-    } else {
-        HOOK_LOGI("pool: single-map, raw_mprotect toggle (brief RWX)");
-    }
+    HOOK_LOGI("pool: R-X %p (%zuKB), writes via server pwrite", exec_mem, size / 1024);
 
     return 0;
 }

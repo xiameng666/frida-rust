@@ -53,11 +53,10 @@ static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(String)` on failure
-pub fn init_hook_engine(exec_mem: *mut u8, rw_mem: *mut u8, size: usize) -> Result<(), String> {
+pub fn init_hook_engine(exec_mem: *mut u8, size: usize) -> Result<(), String> {
     let result = unsafe {
         ffi::hook::hook_engine_init(
             exec_mem as *mut _,
-            rw_mem as *mut _,
             size,
         )
     };
@@ -127,7 +126,7 @@ fn hide_so(server_fd: i32) {
     }
 
     // Run test: logs before/after enumeration via logcat
-    let name = b"memfd\0";
+    let name = b"xiam\0";
     unsafe { ffi::hook::so_hide_test(name.as_ptr() as *const _) };
 }
 
@@ -195,55 +194,6 @@ impl Drop for JSEngine {
 unsafe impl Send for JSEngine {}
 unsafe impl Sync for JSEngine {}
 
-/// Try to set up a dual-mapped pool via memfd_create.
-/// Returns true on success (hook engine initialized), false on failure.
-#[cfg(target_os = "android")]
-fn try_dual_mapping(size: usize) -> bool {
-    // memfd_create("xm-jit-cache", MFD_CLOEXEC)
-    let fd = unsafe {
-        libc::syscall(libc::SYS_memfd_create, b"xm-jit-cache\0".as_ptr(), 1u32 /* MFD_CLOEXEC */)
-    } as i32;
-    if fd < 0 {
-        eprintln!("[XiaM-hook] memfd_create failed (errno={}), falling back",
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
-        return false;
-    }
-
-    if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
-        unsafe { libc::close(fd) };
-        return false;
-    }
-
-    let rw = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(), size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED, fd, 0,
-        )
-    };
-    let rx = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(), size,
-            libc::PROT_READ | libc::PROT_EXEC,
-            libc::MAP_SHARED, fd, 0,
-        )
-    };
-
-    unsafe { libc::close(fd) }; // fd no longer needed after both mappings
-
-    if rw == libc::MAP_FAILED || rx == libc::MAP_FAILED {
-        if rw != libc::MAP_FAILED { unsafe { libc::munmap(rw, size) }; }
-        if rx != libc::MAP_FAILED { unsafe { libc::munmap(rx, size) }; }
-        eprintln!("[XiaM-hook] dual-mapping mmap failed, falling back");
-        return false;
-    }
-
-    let _ = init_hook_engine(rx as *mut u8, rw as *mut u8, size);
-    eprintln!("[XiaM-hook] pool: dual-map rx={:?} rw={:?} ({} KB) — zero RWX",
-        rx, rw, size / 1024);
-    true
-}
-
 /// Get or initialize the global JS engine
 pub fn get_or_init_engine() -> Result<(), String> {
     // 确保 hook 引擎已初始化（仅 Android）
@@ -253,54 +203,26 @@ pub fn get_or_init_engine() -> Result<(), String> {
         HOOK_INIT.call_once(|| {
             const POOL_SIZE: usize = 1024 * 1024; // 1 MB
 
-            // Strategy 1: dual-mapping via memfd (zero RWX, zero mprotect)
-            if try_dual_mapping(POOL_SIZE) {
-                let sfd = connect_patcher_server();
-                hide_so(sfd);
-                return;
-            }
-
-            // Strategy 2: single mapping with mprotect toggle / proc_mem
-            // Try RWX mmap first (proves kernel allows toggle).
+            // Anonymous mmap R-X — no memfd, no mprotect, no fingerprint in maps
+            // All pool writes go through server pwrite (/proc/<pid>/mem bypasses page protection)
             let mem = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
                     POOL_SIZE,
-                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::PROT_READ | libc::PROT_EXEC,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                     -1,
                     0,
                 )
             };
-            if mem != libc::MAP_FAILED {
-                let _ = init_hook_engine(mem as *mut u8, std::ptr::null_mut(), POOL_SIZE);
-                unsafe { libc::mprotect(mem, POOL_SIZE, libc::PROT_READ | libc::PROT_EXEC); }
-                let sfd = connect_patcher_server();
-                hide_so(sfd);
-                eprintln!("[XiaM-hook] pool: {:?} ({} KB) single-map R-X", mem, POOL_SIZE / 1024);
-            } else {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
-                let mem = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        POOL_SIZE,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    )
-                };
-                if mem != libc::MAP_FAILED {
-                    let _ = init_hook_engine(mem as *mut u8, std::ptr::null_mut(), POOL_SIZE);
-                    unsafe { libc::mprotect(mem, POOL_SIZE, libc::PROT_READ | libc::PROT_EXEC); }
-                    let sfd = connect_patcher_server();
-                    hide_so(sfd);
-                    eprintln!("[XiaM-hook] pool: {:?} ({} KB) single-map R-X (RWX denied, errno={})",
-                        mem, POOL_SIZE / 1024, errno);
-                } else {
-                    eprintln!("[XiaM-hook] pool: mmap failed — hook engine disabled!");
-                }
+            if mem == libc::MAP_FAILED {
+                eprintln!("[XiaM-hook] pool: mmap R-X failed — hook engine disabled!");
+                return;
             }
+            let _ = init_hook_engine(mem as *mut u8, POOL_SIZE);
+            let sfd = connect_patcher_server();
+            hide_so(sfd);
+            eprintln!("[XiaM-hook] pool: {:?} ({} KB) anonymous R-X", mem, POOL_SIZE / 1024);
         });
     }
 

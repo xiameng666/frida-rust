@@ -4,13 +4,12 @@
 
 ## 🔴 高风险（常规反作弊必查）
 
-### 1. /proc/self/maps — memfd 名称暴露
-- 双映射 hook pool 产生的 `memfd:xm-jit-cache` 在 maps 中有 **RW + R-X 两段映射**
-- SO 本体映射显示为 `/memfd:xm-jit-cache (deleted)`
+### 1. /proc/self/maps — SO 加载 memfd 残留
+- ~~hook pool 双映射 `memfd:xiam`~~ → **已消除**: 改为匿名 `mmap(R-X)`，无 memfd
+- SO 本体仍通过 memfd 加载（`remote_inject` 中 `memfd_create("xiam")`），maps 中残留 `/memfd:xiam (deleted)` 路径
 - maps 由内核维护，**用户态无法删除或修改条目**
-- 任何 app 只需 `fopen("/proc/self/maps")` 搜索 `memfd` 或 `xm-jit` 即可发现
 
-**缓解**: memfd_create 使用伪装名（如空字符串 `""` 或伪装为系统 JIT，如 `jit-cache`）
+**缓解**: SO 加载 memfd 改名为空字符串或伪装名
 
 ### 2. /proc/net/unix — 抽象 socket 暴露
 - `@xiam_patcher` 抽象 socket 在 `/proc/net/unix` 中可见
@@ -28,11 +27,12 @@
 ## 🟡 中等风险
 
 ### 4. /proc/self/fd/ — 文件描述符泄露
-- memfd fd 未关闭（关闭会导致 linker SIGILL）— `readlink /proc/self/fd/<N>` 显示 `memfd:xm-jit-cache`
+- ~~hook pool memfd fd~~ → **已消除**: 改为匿名 mmap，无 fd
+- SO 加载 memfd fd 未关闭（关闭导致 linker SIGILL）— `readlink` 显示 `memfd:xiam`
 - patcher 抽象 socket fd（`@xiam_patcher`）
 - TCP socket fd（连接 `127.0.0.1:12708`）
 
-**缓解**: memfd 名伪装后 fd 特征自然降低；关闭不需要的 fd
+**缓解**: SO memfd 名伪装后 fd 特征降低；关闭不需要的 fd
 
 ### 5. /proc/net/tcp — 回环连接
 - adb reverse 转发产生 `127.0.0.1:12708` TCP 连接
@@ -43,7 +43,7 @@
 ### 6. .rodata 字符串常量（内存扫描）
 SO 二进制中包含以下可辨识字符串:
 - `"XiaM-hook"`, `"XiaM-hide"` — log tag
-- `"xm-jit-cache"` — memfd 名称
+- `"xiam"` — SO 加载 memfd 名称（hook pool 已不再使用 memfd）
 - `"xiam_patcher"` — socket 名称
 - `"hello_entry"` — 导出符号名
 - `"/alone12345678"` — stub marker（仅 Zygote 中，注入后已恢复）
@@ -62,7 +62,7 @@ SO 二进制中包含以下可辨识字符串:
 
 ### 8. Inline Hook 代码完整性
 - 被 hook 函数的前几条指令被替换为跳转（B/BR 到 trampoline）
-- trampoline 代码位于 `memfd:xm-jit-cache` R-X 映射中
+- trampoline 代码位于匿名 R-X 映射中（已无 memfd 特征名）
 - 代码完整性校验（CRC/hash 比对 .text 段）可检测
 
 **缓解**: 使用 hardware breakpoint 代替 inline patch（需内核支持）
@@ -89,12 +89,13 @@ SO 二进制中包含以下可辨识字符串:
 | `dl_iterate_phdr` 枚举可见 | soinfo + link_map 摘除后不再可见 | ✅ 已实现 |
 | ELF header 标识 SO 存在 | 64 字节清零（通过 server pwrite） | ✅ 已实现 |
 | /proc/self/mem 自身读写 | 改用 server pwrite 代替 | ✅ 已实现 |
-| RWX 内存页 | 双映射 memfd（RW + R-X 分离） | ✅ 已实现 |
-| mprotect 切换 | server pwrite 消除 mprotect 调用 | ✅ 已实现 |
+| RWX 内存页 | 匿名 mmap R-X + server pwrite（零 RWX） | ✅ 已实现 |
+| mprotect 调用 | server pwrite 绕过页面保护，零 mprotect | ✅ 已实现 |
+| hook pool memfd 特征 | 去掉 memfd 双映射，改匿名 mmap(R-X) | ✅ 已实现 |
 
 ## 下一步优先级
 
-1. **memfd 改名** — 将 `xm-jit-cache` 改为空字符串或伪装名 → 消除 maps 最大特征
+1. **SO 加载 memfd 改名** — `remote_inject` 中 `xiam` 改为空字符串或伪装名
 2. **Release 去日志** — 条件编译移除所有 `__android_log_print` 和 `eprintln!`
 3. **Socket 随机化** — `@xiam_patcher` 改用运行时生成的随机名称
 4. **字符串混淆** — 编译期加密 .rodata 中的敏感字符串
