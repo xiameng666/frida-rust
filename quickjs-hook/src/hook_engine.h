@@ -66,6 +66,7 @@ typedef struct {
     pthread_mutex_t lock;           /* Thread safety lock */
     size_t exec_mem_page_size;      /* Page size for mprotect */
     int initialized;                /* Initialization flag */
+    int server_fd;                  /* Patcher server socket fd (-1 = unavailable) */
 } HookEngine;
 
 /*
@@ -121,6 +122,14 @@ void* hook_get_trampoline(void* target);
  * Cleanup and free all hooks
  */
 void hook_engine_cleanup(void);
+
+/*
+ * Set patcher server socket fd for remote target memory read/write.
+ * The server (root process) does pwrite/pread on /proc/<pid>/mem.
+ *
+ * @param fd  Connected socket fd, or -1 to disable
+ */
+void hook_engine_set_server(int fd);
 
 /* Internal functions - exposed for advanced use */
 

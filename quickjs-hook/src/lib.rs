@@ -69,6 +69,47 @@ pub fn init_hook_engine(exec_mem: *mut u8, rw_mem: *mut u8, size: usize) -> Resu
     }
 }
 
+/// Connect to patcher server via abstract unix socket and set the fd.
+#[cfg(target_os = "android")]
+fn connect_patcher_server() {
+    // std UnixStream doesn't support abstract sockets directly, use raw syscall
+    let fd = unsafe {
+        let sock = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if sock < 0 {
+            eprintln!("[XiaM-hook] patcher: socket() failed");
+            return;
+        }
+
+        // Build sockaddr_un with abstract name
+        let mut sa: libc::sockaddr_un = std::mem::zeroed();
+        sa.sun_family = libc::AF_UNIX as u16;
+        // Abstract: sun_path[0] = '\0', then name bytes
+        let name = b"\0xiam_patcher";
+        if name.len() > sa.sun_path.len() {
+            libc::close(sock);
+            return;
+        }
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            sa.sun_path.as_mut_ptr() as *mut u8,
+            name.len(),
+        );
+
+        let sa_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len()) as libc::socklen_t;
+        let ret = libc::connect(sock, &sa as *const _ as *const libc::sockaddr, sa_len);
+        if ret < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            eprintln!("[XiaM-hook] patcher: connect failed (errno={})", err);
+            libc::close(sock);
+            return;
+        }
+        sock
+    };
+
+    unsafe { ffi::hook::hook_engine_set_server(fd) };
+    eprintln!("[XiaM-hook] patcher: connected fd={}", fd);
+}
+
 /// Cleanup the hook engine
 pub fn cleanup_hook_engine() {
     unsafe {
@@ -193,6 +234,7 @@ pub fn get_or_init_engine() -> Result<(), String> {
 
             // Strategy 1: dual-mapping via memfd (zero RWX, zero mprotect)
             if try_dual_mapping(POOL_SIZE) {
+                connect_patcher_server();
                 return;
             }
 
@@ -211,6 +253,7 @@ pub fn get_or_init_engine() -> Result<(), String> {
             if mem != libc::MAP_FAILED {
                 let _ = init_hook_engine(mem as *mut u8, std::ptr::null_mut(), POOL_SIZE);
                 unsafe { libc::mprotect(mem, POOL_SIZE, libc::PROT_READ | libc::PROT_EXEC); }
+                connect_patcher_server();
                 eprintln!("[XiaM-hook] pool: {:?} ({} KB) single-map R-X", mem, POOL_SIZE / 1024);
             } else {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
@@ -227,6 +270,7 @@ pub fn get_or_init_engine() -> Result<(), String> {
                 if mem != libc::MAP_FAILED {
                     let _ = init_hook_engine(mem as *mut u8, std::ptr::null_mut(), POOL_SIZE);
                     unsafe { libc::mprotect(mem, POOL_SIZE, libc::PROT_READ | libc::PROT_EXEC); }
+                    connect_patcher_server();
                     eprintln!("[XiaM-hook] pool: {:?} ({} KB) single-map R-X (RWX denied, errno={})",
                         mem, POOL_SIZE / 1024, errno);
                 } else {

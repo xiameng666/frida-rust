@@ -9,6 +9,7 @@
 mod elf;
 mod injector;
 mod mem;
+mod patcher;
 mod payload;
 mod proc;
 mod ptrace;

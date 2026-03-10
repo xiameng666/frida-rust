@@ -101,6 +101,28 @@ push-ldmonitor: ldmonitor
     adb shell su -c "chmod 755 /data/local/tmp/ldmonitor"
     adb shell rm //sdcard/ldmonitor
 
+# 编译并运行 raw syscall 测试
+test-syscall:
+    {{ndk_bin}}\\aarch64-linux-android{{android_api}}-clang.cmd -O2 -o tests/test_raw_syscall tests/test_raw_syscall.c -static
+    adb push tests/test_raw_syscall //sdcard/test_raw_syscall
+    adb shell su -c "cp /sdcard/test_raw_syscall /data/local/tmp/test_raw_syscall"
+    adb shell su -c "chmod 755 /data/local/tmp/test_raw_syscall"
+    adb shell rm //sdcard/test_raw_syscall
+    adb shell su -c /data/local/tmp/test_raw_syscall
+
+# 编译并推送 pwrite 测试
+test-pwrite:
+    {{ndk_bin}}\\aarch64-linux-android{{android_api}}-clang.cmd -O2 -o tests/test_pwrite tests/test_pwrite.c -static
+    adb push tests/test_pwrite //sdcard/test_pwrite
+    adb shell su -c "cp /sdcard/test_pwrite /data/local/tmp/test_pwrite"
+    adb shell su -c "chmod 755 /data/local/tmp/test_pwrite"
+    adb shell rm //sdcard/test_pwrite
+    @echo "=== Test 1: self pwrite (as root) ==="
+    adb shell su -c /data/local/tmp/test_pwrite self
+    @echo ""
+    @echo "=== Test 2: cross-process pwrite (fork) ==="
+    adb shell su -c /data/local/tmp/test_pwrite fork
+
 # adb 端口转发
 forward:
     adb reverse tcp:12708 tcp:12708

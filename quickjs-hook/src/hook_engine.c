@@ -9,11 +9,6 @@
 #include "hook_engine.h"
 #include "arm64_writer.h"
 #include "arm64_relocator.h"
-#include <string.h>
-#include <sys/mman.h>
-#include <sys/prctl.h>
-#include <unistd.h>
-#include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -27,16 +22,185 @@
 #define HOOK_LOGW(...) fprintf(stderr, "[hook-warn] " __VA_ARGS__)
 #endif
 
-/* wxshadow prctl operations - shadow page patching */
+/* =========================================================================
+ * Raw syscall wrappers + inline libc replacements
+ * 绕过 PLT/GOT，避免被 libc inline hook 拦截
+ * ========================================================================= */
+
+#if defined(__aarch64__)
+
+#define __NR_mprotect 226
+#define __NR_prctl    167
+
+static long raw_syscall3(long n, long a, long b, long c) {
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    __asm__ volatile("svc 0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+
+static long raw_syscall5(long n, long a, long b, long c, long d, long e) {
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    register long x4 __asm__("x4") = e;
+    __asm__ volatile("svc 0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4) : "memory");
+    return x0;
+}
+
+static int raw_mprotect(void* addr, size_t len, int prot) {
+    return (int)raw_syscall3(__NR_mprotect, (long)addr, (long)len, (long)prot);
+}
+
+static int raw_prctl(int option, unsigned long a2, unsigned long a3,
+                     unsigned long a4, unsigned long a5) {
+    return (int)raw_syscall5(__NR_prctl, (long)option, (long)a2,
+                             (long)a3, (long)a4, (long)a5);
+}
+
+#define __NR_read  63
+#define __NR_write 64
+
+static long raw_read(int fd, void* buf, size_t count) {
+    return raw_syscall3(__NR_read, (long)fd, (long)buf, (long)count);
+}
+
+static long raw_write(int fd, const void* buf, size_t count) {
+    return raw_syscall3(__NR_write, (long)fd, (long)buf, (long)count);
+}
+
+#else
+/* �?aarch64: 回退�?libc */
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+#define raw_mprotect mprotect
+#define raw_prctl    prctl
+#define raw_read(fd,buf,n)   read(fd,buf,n)
+#define raw_write(fd,buf,n)  write(fd,buf,n)
+#endif
+
+/* mmap prot flags */
+#ifndef PROT_READ
+#define PROT_READ  0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC  0x4
+#endif
+
+/* PLT-free hook_memcpy/hook_memset �?不经�?libc，防止被 inline hook 拦截 */
+__attribute__((always_inline))
+static inline void* hook_memcpy(void* dst, const void* src, size_t n) {
+    volatile uint8_t* d = (volatile uint8_t*)dst;
+    const volatile uint8_t* s = (const volatile uint8_t*)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+__attribute__((always_inline))
+static inline void* hook_memset(void* dst, int c, size_t n) {
+    volatile uint8_t* d = (volatile uint8_t*)dst;
+    while (n--) *d++ = (uint8_t)c;
+    return dst;
+}
+
+/* wxshadow prctl operations */
 #ifndef PR_WXSHADOW_PATCH
-#define PR_WXSHADOW_PATCH   0x5758    /* prctl(PR_WXSHADOW_PATCH, page_addr, buf, len) */
+#define PR_WXSHADOW_PATCH   0x5758
 #endif
 #ifndef PR_WXSHADOW_RELEASE
-#define PR_WXSHADOW_RELEASE 0x5759    /* prctl(PR_WXSHADOW_RELEASE, page_addr, len) */
+#define PR_WXSHADOW_RELEASE 0x5759
 #endif
 
 /* Global engine state */
 static HookEngine g_engine = {0};
+
+/* =========================================================================
+ * Server pwrite protocol -- target code page read/write via root server
+ * ========================================================================= */
+
+#define PATCH_OP_READ  1
+#define PATCH_OP_WRITE 2
+
+typedef struct __attribute__((packed)) {
+    uint8_t  opcode;
+    uint64_t addr;
+    uint32_t len;
+} PatchReqHeader;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  status;
+    uint32_t len;
+} PatchRespHeader;
+
+static int send_all(int fd, const void* buf, size_t len) {
+    const uint8_t* p = (const uint8_t*)buf;
+    while (len > 0) {
+        long n = raw_write(fd, p, len);
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int recv_all(int fd, void* buf, size_t len) {
+    uint8_t* p = (uint8_t*)buf;
+    while (len > 0) {
+        long n = raw_read(fd, p, len);
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/*
+ * Read from target code page.
+ * Uses server pread if available, otherwise direct hook_memcpy (R-X is readable).
+ */
+static int target_read(void* addr, void* buf, size_t len) {
+    if (g_engine.server_fd >= 0) {
+        PatchReqHeader req = { PATCH_OP_READ, (uint64_t)(uintptr_t)addr, (uint32_t)len };
+        if (send_all(g_engine.server_fd, &req, sizeof(req)) != 0) goto fallback;
+        PatchRespHeader resp;
+        if (recv_all(g_engine.server_fd, &resp, sizeof(resp)) != 0) goto fallback;
+        if (resp.status != 0 || resp.len != (uint32_t)len) goto fallback;
+        if (recv_all(g_engine.server_fd, buf, len) != 0) goto fallback;
+        return 0;
+    }
+fallback:
+    /* R-X pages are readable -- direct copy */
+    hook_memcpy(buf, addr, len);
+    return 0;
+}
+
+/*
+ * Write to target code page via server pwrite.
+ * NO mprotect, NO RWX -- server writes through /proc/<pid>/mem.
+ * Caller must flush icache after this returns.
+ */
+static int target_write(void* addr, const void* buf, size_t len) {
+    if (g_engine.server_fd < 0) {
+        HOOK_LOGW("target_write: no server fd -- cannot write %p", addr);
+        return -1;
+    }
+    PatchReqHeader req = { PATCH_OP_WRITE, (uint64_t)(uintptr_t)addr, (uint32_t)len };
+    if (send_all(g_engine.server_fd, &req, sizeof(req)) != 0) return -1;
+    if (send_all(g_engine.server_fd, buf, len) != 0) return -1;
+    PatchRespHeader resp;
+    if (recv_all(g_engine.server_fd, &resp, sizeof(resp)) != 0) return -1;
+    if (resp.status != 0) {
+        HOOK_LOGW("target_write: server returned error for %p len=%zu", addr, len);
+        return -1;
+    }
+    HOOK_LOGI("target_write: server pwrite %p len=%zu OK", addr, len);
+    return 0;
+}
+
 
 
 /* Minimum instructions to relocate for our jump sequence.
@@ -56,22 +220,22 @@ static HookEngine g_engine = {0};
 
 /* --- Pool permission management ---
  * Two write strategies (in priority order):
- *   1. Dual-mapping (exec_mem_rw != NULL) → memcpy to RW view, zero RWX ever
- *   2. mprotect toggle: R-X → RWX → write → R-X
+ *   1. Dual-mapping (exec_mem_rw != NULL) �?hook_memcpy to RW view, zero RWX ever
+ *   2. raw_mprotect toggle: R-X �?RWX �?write �?R-X
  * HookEntry structs live on the heap (malloc), not in the pool.
  */
 
 static int pool_make_writable(void) {
     if (!g_engine.exec_mem) return -1;
     if (g_engine.exec_mem_rw) return 0;   /* dual-mapping: RW view always writable */
-    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
+    return raw_mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
                     PROT_READ | PROT_WRITE | PROT_EXEC);
 }
 
 static int pool_make_executable(void) {
     if (!g_engine.exec_mem) return -1;
     if (g_engine.exec_mem_rw) return 0;   /* dual-mapping: R-X view always executable */
-    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
+    return raw_mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
                     PROT_READ | PROT_EXEC);
 }
 
@@ -90,7 +254,7 @@ static HookEntry* alloc_entry(void) {
         void* saved_thunk = entry->thunk;
         size_t saved_thunk_alloc = entry->thunk_alloc;
 
-        memset(entry, 0, sizeof(HookEntry));
+        hook_memset(entry, 0, sizeof(HookEntry));
 
         entry->trampoline = saved_trampoline;
         entry->trampoline_alloc = saved_trampoline_alloc;
@@ -98,7 +262,7 @@ static HookEntry* alloc_entry(void) {
         entry->thunk_alloc = saved_thunk_alloc;
     } else {
         entry = (HookEntry*)malloc(sizeof(HookEntry));
-        if (entry) memset(entry, 0, sizeof(HookEntry));
+        if (entry) hook_memset(entry, 0, sizeof(HookEntry));
     }
 
     return entry;
@@ -127,7 +291,7 @@ void hook_flush_cache(void* start, size_t size) {
 }
 
 /*
- * Write data to target address via wxshadow prctl.
+ * Write data to target address via wxshadow raw_prctl.
  * Automatically handles the case where the patch spans two pages.
  *
  * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure.
@@ -139,20 +303,20 @@ static int wxshadow_patch(void* addr, const void* buf, size_t len) {
     size_t offset_in_page = start - page1;
 
     if (offset_in_page + len <= 4096) {
-        /* Single page — one prctl call */
-        if (prctl(PR_WXSHADOW_PATCH, page1, buf, len, offset_in_page) != 0) {
+        /* Single page �?one raw_prctl call */
+        if (raw_prctl(PR_WXSHADOW_PATCH, page1, (unsigned long)buf, len, offset_in_page) != 0) {
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
     } else {
-        /* Spans two pages — split into two calls */
+        /* Spans two pages �?split into two calls */
         size_t first_len = 4096 - offset_in_page;
         size_t second_len = len - first_len;
         uintptr_t page2 = page1 + 4096;
 
-        if (prctl(PR_WXSHADOW_PATCH, page1, buf, first_len, offset_in_page) != 0) {
+        if (raw_prctl(PR_WXSHADOW_PATCH, page1, (unsigned long)buf, first_len, offset_in_page) != 0) {
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
-        if (prctl(PR_WXSHADOW_PATCH, page2, (const uint8_t*)buf + first_len, second_len, 0) != 0) {
+        if (raw_prctl(PR_WXSHADOW_PATCH, page2, (unsigned long)((const uint8_t*)buf + first_len), second_len, 0) != 0) {
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
     }
@@ -172,7 +336,7 @@ static int wxshadow_release(void* addr, size_t len) {
     size_t offset_in_page = start - page1;
 
     if (offset_in_page + len <= 4096) {
-        if (prctl(PR_WXSHADOW_RELEASE, page1, len, offset_in_page, 0) != 0) {
+        if (raw_prctl(PR_WXSHADOW_RELEASE, page1, len, offset_in_page, 0) != 0) {
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
     } else {
@@ -180,10 +344,10 @@ static int wxshadow_release(void* addr, size_t len) {
         size_t second_len = len - first_len;
         uintptr_t page2 = page1 + 4096;
 
-        if (prctl(PR_WXSHADOW_RELEASE, page1, first_len, offset_in_page, 0) != 0) {
+        if (raw_prctl(PR_WXSHADOW_RELEASE, page1, first_len, offset_in_page, 0) != 0) {
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
-        if (prctl(PR_WXSHADOW_RELEASE, page2, second_len, 0, 0) != 0) {
+        if (raw_prctl(PR_WXSHADOW_RELEASE, page2, second_len, 0, 0) != 0) {
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
     }
@@ -192,18 +356,18 @@ static int wxshadow_release(void* addr, size_t len) {
 
 /*
  * Write to the hook pool.
- *   1. Dual-mapping: translate R-X addr → RW addr, direct memcpy (no RWX, no syscall)
- *   2. Fallback: direct memcpy (caller made pool RWX via pool_make_writable)
+ *   1. Dual-mapping: translate R-X addr �?RW addr, direct hook_memcpy (no RWX, no syscall)
+ *   2. Fallback: direct hook_memcpy (caller made pool RWX via pool_make_writable)
  */
 static int pool_write(void* pool_addr, const void* src, size_t len) {
-    /* Strategy 1: dual-mapping — translate to RW view */
+    /* Strategy 1: dual-mapping �?translate to RW view */
     if (g_engine.exec_mem_rw) {
         size_t offset = (uint8_t*)pool_addr - (uint8_t*)g_engine.exec_mem;
-        memcpy((uint8_t*)g_engine.exec_mem_rw + offset, src, len);
+        hook_memcpy((uint8_t*)g_engine.exec_mem_rw + offset, src, len);
         return 0;
     }
-    /* Strategy 2: direct memcpy (pool is temporarily RWX) */
-    memcpy(pool_addr, src, len);
+    /* Strategy 2: direct hook_memcpy (pool is temporarily RWX) */
+    hook_memcpy(pool_addr, src, len);
     return 0;
 }
 
@@ -306,15 +470,16 @@ int hook_engine_init(void* exec_mem, void* rw_mem, size_t size) {
     g_engine.exec_mem_used = 0;
     g_engine.hooks = NULL;
     g_engine.free_list = NULL;
-    g_engine.exec_mem_page_size = (size_t)sysconf(_SC_PAGESIZE);
+    g_engine.exec_mem_page_size = (size_t)4096;
     pthread_mutex_init(&g_engine.lock, NULL);
+    g_engine.server_fd = -1;
     g_engine.initialized = 1;
 
     if (rw_mem) {
-        HOOK_LOGI("pool: dual-mapping active (rx=%p rw=%p %zuKB) — zero RWX",
+        HOOK_LOGI("pool: dual-mapping active (rx=%p rw=%p %zuKB) �?zero RWX",
                   exec_mem, rw_mem, size / 1024);
     } else {
-        HOOK_LOGI("pool: single-map, mprotect toggle (brief RWX)");
+        HOOK_LOGI("pool: single-map, raw_mprotect toggle (brief RWX)");
     }
 
     return 0;
@@ -365,15 +530,11 @@ void* hook_install(void* target, void* replacement, int stealth) {
         return NULL;
     }
 
-    /* Read original bytes: mprotect readable then memcpy */
-    {
-        uintptr_t target_page = (uintptr_t)target & ~0xFFF;
-        mprotect((void*)target_page, 0x2000, PROT_READ | PROT_EXEC);
-        memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
-    }
+    /* Read original bytes via server or direct read (R-X is readable) */
+    target_read(target, entry->original_bytes, MIN_HOOK_SIZE);
     entry->original_size = MIN_HOOK_SIZE;
 
-    /* Relocate original instructions to trampoline (writes to pool via proc_mem_write) */
+    /* Relocate original instructions to trampoline */
     size_t relocated_size = hook_relocate_instructions_ex(
         entry->original_bytes, (uint64_t)target, entry->trampoline, MIN_HOOK_SIZE);
 
@@ -414,16 +575,12 @@ void* hook_install(void* target, void* replacement, int stealth) {
         }
 
         if (!patched) {
-            /* mprotect + direct write */
-            uintptr_t target_page = (uintptr_t)target & ~0xFFF;
-            if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            /* Server pwrite -- zero mprotect, zero RWX */
+            if (target_write(target, jump_buf, MIN_HOOK_SIZE) != 0) {
                 free_entry(entry);
                 pthread_mutex_unlock(&g_engine.lock);
                 return NULL;
             }
-            memcpy(target, jump_buf, MIN_HOOK_SIZE);
-            hook_flush_cache(target, MIN_HOOK_SIZE);
-            mprotect((void*)target_page, 0x2000, PROT_READ | PROT_EXEC);
             entry->stealth = 0;
         }
     }
@@ -585,12 +742,8 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     entry->on_leave = on_leave;
     entry->user_data = user_data;
 
-    /* Read original bytes: ensure page is readable then memcpy */
-    {
-        uintptr_t target_page = (uintptr_t)target & ~0xFFF;
-        mprotect((void*)target_page, 0x2000, PROT_READ | PROT_EXEC);
-        memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
-    }
+    /* Read original bytes via server or direct read */
+    target_read(target, entry->original_bytes, MIN_HOOK_SIZE);
     entry->original_size = MIN_HOOK_SIZE;
 
     /* Allocate trampoline (reuse if available and large enough) */
@@ -664,20 +817,16 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         }
 
         if (!patched) {
-            /* mprotect + direct write, then restore R-X */
-            uintptr_t target_page = (uintptr_t)target & ~0xFFF;
-            if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                HOOK_LOGW("hook_attach: mprotect failed for %p (errno=%d)", target, errno);
+            /* Server pwrite -- zero mprotect, zero RWX */
+            if (target_write(target, jump_buf, MIN_HOOK_SIZE) != 0) {
+                HOOK_LOGW("hook_attach: server pwrite failed for %p", target);
                 free_entry(entry);
                 pthread_mutex_unlock(&g_engine.lock);
                 return HOOK_ERROR_MPROTECT_FAILED;
             }
-            memcpy(target, jump_buf, MIN_HOOK_SIZE);
-            hook_flush_cache(target, MIN_HOOK_SIZE);
-            mprotect((void*)target_page, 0x2000, PROT_READ | PROT_EXEC);
             entry->stealth = 0;
             patched = 1;
-            HOOK_LOGI("hook_attach: patched %p via mprotect+memcpy", target);
+            HOOK_LOGI("hook_attach: patched %p via server pwrite", target);
         }
     }
 
@@ -719,15 +868,12 @@ int hook_remove(void* target) {
                     return HOOK_ERROR_WXSHADOW_FAILED;
                 }
             } else {
-                /* Normal hook: restore original bytes via mprotect + memcpy, then R-X */
-                uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-                if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                /* Normal hook: restore original bytes via server pwrite */
+                if (target_write(target, entry->original_bytes, entry->original_size) != 0) {
                     pthread_mutex_unlock(&g_engine.lock);
                     return HOOK_ERROR_MPROTECT_FAILED;
                 }
-                memcpy(target, entry->original_bytes, entry->original_size);
                 hook_flush_cache(target, entry->original_size);
-                mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
             }
             hook_flush_cache(target, entry->original_size);
 
@@ -773,10 +919,7 @@ void hook_engine_cleanup(void) {
         if (entry->stealth) {
             wxshadow_release(entry->target, entry->original_size);
         } else {
-            uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
-            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
-            memcpy(entry->target, entry->original_bytes, entry->original_size);
-            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
+            target_write(entry->target, entry->original_bytes, entry->original_size);
         }
         hook_flush_cache(entry->target, entry->original_size);
         HookEntry* next = entry->next;
@@ -800,4 +943,11 @@ void hook_engine_cleanup(void) {
 
     pthread_mutex_unlock(&g_engine.lock);
     pthread_mutex_destroy(&g_engine.lock);
+}
+/* Set patcher server socket fd */
+void hook_engine_set_server(int fd) {
+    g_engine.server_fd = fd;
+    if (fd >= 0) {
+        HOOK_LOGI("server fd set to %d -- target writes via pwrite", fd);
+    }
 }

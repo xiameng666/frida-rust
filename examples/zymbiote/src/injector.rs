@@ -556,6 +556,19 @@ fn start_notify_listener(agent_so: &'static [u8]) -> io::Result<(i32, JoinHandle
                     let pid = i32::from_le_bytes(pid_buf);
                     eprintln!("[*] stub notification: pid={pid}");
 
+                    // Start patcher BEFORE injection so @xiam_patcher
+                    // is already listening when the SO tries to connect.
+                    let _patcher = match crate::patcher::start_patcher(pid) {
+                        Ok(h) => {
+                            eprintln!("[+] patcher server started for pid {pid}");
+                            Some(h)
+                        }
+                        Err(e) => {
+                            eprintln!("[!] patcher start failed: {e}");
+                            None
+                        }
+                    };
+
                     // Perform ptrace + memfd injection.
                     match remote_inject::inject_memfd(pid, agent_so) {
                         Ok(()) => {
