@@ -13,7 +13,6 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -39,6 +38,7 @@
 /* Global engine state */
 static HookEngine g_engine = {0};
 
+
 /* Minimum instructions to relocate for our jump sequence.
  * arm64_writer_put_branch_address uses MOVZ/MOVK + BR:
  * - Up to 4 MOV instructions (16 bytes) for 64-bit address
@@ -55,20 +55,24 @@ static HookEngine g_engine = {0};
 #define THUNK_ALLOC_SIZE 512
 
 /* --- Pool permission management ---
- * Pool is mapped as RWX on rooted devices (simplifies writes).
- * If SELinux blocks RWX, falls back to R-X with /proc/self/mem writes.
- * All pool writes go through pool_write() which handles both cases.
+ * Two write strategies (in priority order):
+ *   1. Dual-mapping (exec_mem_rw != NULL) → memcpy to RW view, zero RWX ever
+ *   2. mprotect toggle: R-X → RWX → write → R-X
  * HookEntry structs live on the heap (malloc), not in the pool.
  */
 
 static int pool_make_writable(void) {
-    /* Pool may be RWX (no-op) or R-X (no-op; writes go through proc_mem_write) */
-    return 0;
+    if (!g_engine.exec_mem) return -1;
+    if (g_engine.exec_mem_rw) return 0;   /* dual-mapping: RW view always writable */
+    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
+                    PROT_READ | PROT_WRITE | PROT_EXEC);
 }
 
 static int pool_make_executable(void) {
-    /* Pool may be RWX (no-op) or already R-X (no-op) */
-    return 0;
+    if (!g_engine.exec_mem) return -1;
+    if (g_engine.exec_mem_rw) return 0;   /* dual-mapping: R-X view always executable */
+    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
+                    PROT_READ | PROT_EXEC);
 }
 
 /* --- Entry free list management (Fix 4: memory reuse) --- */
@@ -186,45 +190,19 @@ static int wxshadow_release(void* addr, size_t len) {
     return 0;
 }
 
-/* ---------------------------------------------------------------------------
- * /proc/self/mem helpers — bypass SELinux mprotect restrictions
- * ---------------------------------------------------------------------------*/
-
 /*
- * Read `len` bytes from virtual address `addr` via /proc/self/mem.
- * Returns 0 on success, -1 on failure.
- */
-static int proc_mem_read(void* dst, const void* addr, size_t len) {
-    int fd = open("/proc/self/mem", O_RDONLY);
-    if (fd < 0) return -1;
-    ssize_t n = pread(fd, dst, len, (off_t)(uintptr_t)addr);
-    close(fd);
-    return (n == (ssize_t)len) ? 0 : -1;
-}
-
-/*
- * Write `len` bytes to virtual address `addr` via /proc/self/mem.
- * Returns 0 on success, -1 on failure.
- */
-static int proc_mem_write(void* addr, const void* src, size_t len) {
-    int fd = open("/proc/self/mem", O_WRONLY);
-    if (fd < 0) return -1;
-    ssize_t n = pwrite(fd, src, len, (off_t)(uintptr_t)addr);
-    close(fd);
-    return (n == (ssize_t)len) ? 0 : -1;
-}
-
-/*
- * Write to the hook pool.  Try /proc/self/mem first (works for R-X pools).
- * If that fails, fall back to direct memcpy (works when pool is RWX).
- * Returns 0 on success, -1 on total failure.
+ * Write to the hook pool.
+ *   1. Dual-mapping: translate R-X addr → RW addr, direct memcpy (no RWX, no syscall)
+ *   2. Fallback: direct memcpy (caller made pool RWX via pool_make_writable)
  */
 static int pool_write(void* pool_addr, const void* src, size_t len) {
-    if (proc_mem_write(pool_addr, src, len) == 0)
+    /* Strategy 1: dual-mapping — translate to RW view */
+    if (g_engine.exec_mem_rw) {
+        size_t offset = (uint8_t*)pool_addr - (uint8_t*)g_engine.exec_mem;
+        memcpy((uint8_t*)g_engine.exec_mem_rw + offset, src, len);
         return 0;
-    /* Fallback: direct write — safe when pool is mapped RWX */
-    HOOK_LOGW("pool_write: /proc/self/mem failed for %p (%zu bytes), falling back to direct memcpy",
-              pool_addr, len);
+    }
+    /* Strategy 2: direct memcpy (pool is temporarily RWX) */
     memcpy(pool_addr, src, len);
     return 0;
 }
@@ -313,7 +291,7 @@ size_t hook_relocate_instructions(void* src, void* dst, size_t min_bytes) {
 }
 
 /* Initialize the hook engine */
-int hook_engine_init(void* exec_mem, size_t size) {
+int hook_engine_init(void* exec_mem, void* rw_mem, size_t size) {
     if (g_engine.initialized) {
         return 0; /* Already initialized */
     }
@@ -323,6 +301,7 @@ int hook_engine_init(void* exec_mem, size_t size) {
     }
 
     g_engine.exec_mem = exec_mem;
+    g_engine.exec_mem_rw = rw_mem;  /* NULL if not using dual-mapping */
     g_engine.exec_mem_size = size;
     g_engine.exec_mem_used = 0;
     g_engine.hooks = NULL;
@@ -331,8 +310,12 @@ int hook_engine_init(void* exec_mem, size_t size) {
     pthread_mutex_init(&g_engine.lock, NULL);
     g_engine.initialized = 1;
 
-    /* Pool permissions are managed by the caller (lib.rs) */
-    pool_make_executable();
+    if (rw_mem) {
+        HOOK_LOGI("pool: dual-mapping active (rx=%p rw=%p %zuKB) — zero RWX",
+                  exec_mem, rw_mem, size / 1024);
+    } else {
+        HOOK_LOGI("pool: single-map, mprotect toggle (brief RWX)");
+    }
 
     return 0;
 }
@@ -382,14 +365,10 @@ void* hook_install(void* target, void* replacement, int stealth) {
         return NULL;
     }
 
-    /* Read original bytes via /proc/self/mem (works on execute-only pages) */
-    if (proc_mem_read(entry->original_bytes, target, MIN_HOOK_SIZE) != 0) {
+    /* Read original bytes: mprotect readable then memcpy */
+    {
         uintptr_t target_page = (uintptr_t)target & ~0xFFF;
-        if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return NULL;
-        }
+        mprotect((void*)target_page, 0x2000, PROT_READ | PROT_EXEC);
         memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
     }
     entry->original_size = MIN_HOOK_SIZE;
@@ -398,7 +377,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
     size_t relocated_size = hook_relocate_instructions_ex(
         entry->original_bytes, (uint64_t)target, entry->trampoline, MIN_HOOK_SIZE);
 
-    /* Write jump back → temp buffer then proc_mem_write to pool */
+    /* Write jump-back sequence to pool */
     {
         uint8_t jump_temp[MIN_HOOK_SIZE];
         void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
@@ -408,7 +387,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
             pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
-        proc_mem_write((uint8_t*)entry->trampoline + relocated_size, jump_temp, jump_result);
+        pool_write((uint8_t*)entry->trampoline + relocated_size, jump_temp, jump_result);
     }
 
     /* Patch target: write jump to replacement */
@@ -435,14 +414,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
         }
 
         if (!patched) {
-            if (proc_mem_write(target, jump_buf, MIN_HOOK_SIZE) == 0) {
-                entry->stealth = 0;
-                patched = 1;
-            }
-        }
-
-        if (!patched) {
-            /* Last resort: mprotect + direct write */
+            /* mprotect + direct write */
             uintptr_t target_page = (uintptr_t)target & ~0xFFF;
             if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
                 free_entry(entry);
@@ -450,6 +422,8 @@ void* hook_install(void* target, void* replacement, int stealth) {
                 return NULL;
             }
             memcpy(target, jump_buf, MIN_HOOK_SIZE);
+            hook_flush_cache(target, MIN_HOOK_SIZE);
+            mprotect((void*)target_page, 0x2000, PROT_READ | PROT_EXEC);
             entry->stealth = 0;
         }
     }
@@ -611,21 +585,10 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     entry->on_leave = on_leave;
     entry->user_data = user_data;
 
-    /*
-     * Read original bytes via /proc/self/mem (works even on execute-only pages).
-     * Falls back to direct memcpy if /proc/self/mem fails.
-     */
-    if (proc_mem_read(entry->original_bytes, target, MIN_HOOK_SIZE) != 0) {
-        /* Fallback: try mprotect + direct read */
-        HOOK_LOGW("hook_attach: /proc/self/mem read failed for %p, falling back to mprotect+memcpy", target);
+    /* Read original bytes: ensure page is readable then memcpy */
+    {
         uintptr_t target_page = (uintptr_t)target & ~0xFFF;
-        if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            HOOK_LOGW("hook_attach: mprotect fallback also failed for %p (errno=%d)", target, errno);
-            free_entry(entry);
-            pool_make_executable();
-            pthread_mutex_unlock(&g_engine.lock);
-            return HOOK_ERROR_MPROTECT_FAILED;
-        }
+        mprotect((void*)target_page, 0x2000, PROT_READ | PROT_EXEC);
         memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
     }
     entry->original_size = MIN_HOOK_SIZE;
@@ -649,7 +612,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     size_t relocated_size = hook_relocate_instructions_ex(
         entry->original_bytes, (uint64_t)target, entry->trampoline, MIN_HOOK_SIZE);
 
-    /* Write jump back → temp buffer then proc_mem_write to pool */
+    /* Write jump-back sequence to pool */
     {
         uint8_t jump_temp[MIN_HOOK_SIZE];
         void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
@@ -676,10 +639,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     /* Tighten pool back to R-X before patching target */
     pool_make_executable();
 
-    /* Patch target: write jump to thunk.
-     * Try /proc/self/mem first (no mprotect needed), then mprotect fallback,
-     * then wxshadow for stealth mode.
-     */
+    /* Patch target: write jump to thunk. */
     {
         uint8_t jump_buf[MIN_HOOK_SIZE];
         int jump_result = hook_write_jump(jump_buf, thunk_mem);
@@ -704,25 +664,17 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         }
 
         if (!patched) {
-            /* Try /proc/self/mem write (bypasses SELinux mprotect block) */
-            if (proc_mem_write(target, jump_buf, MIN_HOOK_SIZE) == 0) {
-                HOOK_LOGI("hook_attach: patched %p via /proc/self/mem", target);
-                entry->stealth = 0;
-                patched = 1;
-            }
-        }
-
-        if (!patched) {
-            /* Last resort: mprotect + direct write */
-            HOOK_LOGW("hook_attach: /proc/self/mem write failed for %p, falling back to mprotect+memcpy", target);
+            /* mprotect + direct write, then restore R-X */
             uintptr_t target_page = (uintptr_t)target & ~0xFFF;
             if (mprotect((void*)target_page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                HOOK_LOGW("hook_attach: mprotect fallback also failed for %p (errno=%d)", target, errno);
+                HOOK_LOGW("hook_attach: mprotect failed for %p (errno=%d)", target, errno);
                 free_entry(entry);
                 pthread_mutex_unlock(&g_engine.lock);
                 return HOOK_ERROR_MPROTECT_FAILED;
             }
             memcpy(target, jump_buf, MIN_HOOK_SIZE);
+            hook_flush_cache(target, MIN_HOOK_SIZE);
+            mprotect((void*)target_page, 0x2000, PROT_READ | PROT_EXEC);
             entry->stealth = 0;
             patched = 1;
             HOOK_LOGI("hook_attach: patched %p via mprotect+memcpy", target);
@@ -767,15 +719,15 @@ int hook_remove(void* target) {
                     return HOOK_ERROR_WXSHADOW_FAILED;
                 }
             } else {
-                /* Normal hook: restore original bytes via /proc/self/mem or mprotect */
-                if (proc_mem_write(target, entry->original_bytes, entry->original_size) != 0) {
-                    uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-                    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                        pthread_mutex_unlock(&g_engine.lock);
-                        return HOOK_ERROR_MPROTECT_FAILED;
-                    }
-                    memcpy(target, entry->original_bytes, entry->original_size);
+                /* Normal hook: restore original bytes via mprotect + memcpy, then R-X */
+                uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+                if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                    pthread_mutex_unlock(&g_engine.lock);
+                    return HOOK_ERROR_MPROTECT_FAILED;
                 }
+                memcpy(target, entry->original_bytes, entry->original_size);
+                hook_flush_cache(target, entry->original_size);
+                mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
             }
             hook_flush_cache(target, entry->original_size);
 
@@ -821,11 +773,10 @@ void hook_engine_cleanup(void) {
         if (entry->stealth) {
             wxshadow_release(entry->target, entry->original_size);
         } else {
-            if (proc_mem_write(entry->target, entry->original_bytes, entry->original_size) != 0) {
-                uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
-                mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
-                memcpy(entry->target, entry->original_bytes, entry->original_size);
-            }
+            uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
+            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+            memcpy(entry->target, entry->original_bytes, entry->original_size);
+            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
         }
         hook_flush_cache(entry->target, entry->original_size);
         HookEntry* next = entry->next;

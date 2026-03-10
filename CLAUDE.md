@@ -164,64 +164,296 @@ console.log/warn/error           // 输出到 logcat + 推送到 host
 ptr("0x12345678")                // 构造 NativePointer
 ```
 
-## Hook 引擎原理
+## Hook 引擎详细原理
 
-hook_engine.c 实现 ARM64 inline hook:
+hook_engine.c 实现 ARM64 inline hook，以下是完整生命周期。
 
-1. **mmap 1MB R-X 内存池** — `get_or_init_engine()` 时分配 (先 RW, init 后 mprotect 为 R-X)
-2. **代码生成通过 /proc/self/mem** — arm64_writer 输出到栈临时缓冲区，再通过 `proc_mem_write()` 写入 R-X 池，无需 RWX
-3. **hook_attach** — 搜集目标函数头部指令，relocate 到 trampoline (pool 内)
-4. **生成 thunk** — 保存寄存器 → on_enter 回调 → trampoline(原函数) → on_leave → 恢复
-5. **patch 目标入口** — MOVZ/MOVK + BR X16 跳到 thunk (通过 /proc/self/mem 写入)
-6. **HookEntry 分配在堆上** (malloc)，不占用 pool
+### 1. 内存池初始化 (`get_or_init_engine`)
 
-## 反检测措施 (已实现)
+lib.rs 中通过 `std::sync::Once` 确保只初始化一次：
 
-| 措施 | 效果 |
-|------|------|
-| RWX 消除 | 内存池 mmap RW → init 后 mprotect R-X, 写入通过 /proc/self/mem |
-| HookEntry 堆分配 | entry 用 malloc 不在 pool 中, 减少 R-X 匿名段大小特征 |
-| 线程名伪装 | agent 线程名 "pool-2-thread-1" (模仿 Java 线程池) |
-| memfd 注入 | maps 显示 `/memfd:xiam (deleted)` 而非磁盘 SO 路径 |
-| NativePointer AtomicU32 | NATIVE_POINTER_CLASS_ID 从 thread_local Cell 改为 static AtomicU32 |
+1. **优先 mmap RWX** — `PROT_READ|PROT_WRITE|PROT_EXEC`, `MAP_PRIVATE|MAP_ANONYMOUS`, 1MB
+   - root 设备 SELinux 通常允许，pool 直接可读/写/执行
+   - 日志: `[XiaM-hook] pool: mmap RWX 0x... (1024 KB)`
+2. **RWX 失败 → 降级 RW→R-X** — 先 `PROT_READ|PROT_WRITE` mmap，init 后 `mprotect(R-X)`
+   - pool 写入依赖 `/proc/self/mem` pwrite（部分内核会静默拒绝）
+   - 日志: `[XiaM-hook] pool: RWX mmap failed (errno=...), falling back to RW→R-X`
+3. **调用 `hook_engine_init(mem, 1MB)`** — 设置 g_engine 全局状态、初始化 mutex
+
+> 设备实测: Redmi rubens (Android 13 MIUI V14) 上 RWX mmap 成功，但 `/proc/self/mem` 的 pread/pwrite **全部失败**（hardened kernel），所有操作走 direct memcpy / mprotect fallback。
+
+### 2. Pool 内存布局
+
+```
+pool (1MB, rwxp or r-xp):
+┌──────────────────┬──────────────────┬──────────────────┬───┐
+│ trampoline_0     │ thunk_0          │ trampoline_1     │...│
+│ (256B)           │ (512B)           │ (256B)           │   │
+└──────────────────┴──────────────────┴──────────────────┴───┘
+↑ exec_mem                                    exec_mem_used ↑
+```
+
+- **trampoline** (256B): 存放目标函数被覆盖的前 5 条指令（重定位后）+ 跳回原函数的 jump-back
+- **thunk** (512B): 完整的 hook 调度代码（保存寄存器 → on_enter → 调用原函数 → on_leave → 恢复）
+- **HookEntry** 分配在堆上 (malloc)，不占用 pool
+- 分配是 bump allocator，只增不减；remove hook 后 entry 进 free_list 复用
+
+### 3. pool_write — 统一写入接口
+
+所有往 pool 的写入都经过 `pool_write()`:
+
+```
+pool_write(addr, src, len)
+  ├─ 1. 尝试 /proc/self/mem pwrite  → 成功则返回
+  └─ 2. 失败 → HOOK_LOGW + direct memcpy（RWX pool 下安全）
+```
+
+### 4. hook_attach 完整流程
+
+JS `Interceptor.attach(target, {onEnter, onLeave})` 最终调用 C 的 `hook_attach()`:
+
+```
+hook_attach(target=0x7672e6c020, on_enter, on_leave, user_data, stealth=0)
+  │
+  ├─ 1. 读取目标函数前 20 字节 (5 条 ARM64 指令)
+  │     ├─ /proc/self/mem pread → 成功
+  │     └─ 失败 → mprotect(RWX) + memcpy（带 LOGW）
+  │
+  ├─ 2. 分配 trampoline (256B) + thunk (512B) from pool
+  │     └─ 优先复用 free_list 中的已有分配
+  │
+  ├─ 3. 重定位 (arm64_relocator):
+  │     ├─ 将 5 条原始指令写入 temp buffer
+  │     ├─ PC-relative 指令修正（ADR/ADRP/B/CBZ/LDR literal 等）
+  │     └─ pool_write → trampoline
+  │
+  ├─ 4. 写入 jump-back (MOVZ/MOVK/BR → target+20)
+  │     └─ pool_write → trampoline[relocated_size..]
+  │
+  ├─ 5. 生成 thunk (arm64_writer):
+  │     ├─ SUB SP, SP, #288          ; 分配 HookContext
+  │     ├─ STP x0-x30 → [SP]        ; 保存所有寄存器
+  │     ├─ LDR x16, =on_enter → BLR ; 调用 on_enter(ctx, user_data)
+  │     ├─ LDP x0-x7 ← [SP]         ; 恢复参数（JS 可能已修改）
+  │     ├─ LDR x16, =trampoline → BLR ; 调用原函数
+  │     ├─ STR x0 → [SP]            ; 保存返回值
+  │     ├─ LDR x16, =on_leave → BLR ; 调用 on_leave(ctx, user_data)
+  │     ├─ LDR x0 ← [SP]           ; 恢复返回值（JS 可能已修改）
+  │     ├─ ADD SP, SP, #288 → RET   ; 恢复栈 + 返回
+  │     └─ pool_write → thunk
+  │
+  ├─ 6. patch 目标函数入口 (20 字节 → MOVZ/MOVK/BR X16 跳到 thunk)
+  │     ├─ stealth=1 → wxshadow_patch (prctl PR_WXSHADOW_PATCH)
+  │     ├─ /proc/self/mem pwrite → 成功 (LOGI)
+  │     └─ 失败 → mprotect(RWX) + memcpy (LOGW + LOGI)
+  │
+  └─ 7. flush icache (dc cvau + ic ivau + dsb + isb)
+```
+
+### 5. 调用链 (hook 生效后)
+
+```
+其他线程调用 dlopen("libfoo.so"):
+  │
+  ├─ 执行到 dlopen 入口，前 5 条指令已被替换为:
+  │     MOVZ X16, #thunk_lo
+  │     MOVK X16, #thunk_hi, LSL #16
+  │     MOVK X16, #thunk_hi32, LSL #32
+  │     MOVK X16, #thunk_hi48, LSL #48
+  │     BR   X16              → 跳到 thunk
+  │
+  ├─ thunk 执行:
+  │     保存 x0-x30, SP, PC → HookContext
+  │     on_enter_wrapper(ctx) → JS onEnter(args)  ← args[0]=x0 (filename)
+  │     恢复 x0-x7 (JS 可能修改了参数)
+  │     BLR trampoline       → 执行原始 dlopen (重定位后的 5 条指令 + jump-back)
+  │     保存 x0 (返回值)
+  │     on_leave_wrapper(ctx) → JS onLeave(retval)
+  │     恢复 x0 (JS 可能替换了返回值)
+  │     RET                   → 返回调用者
+  │
+  └─ 对调用者透明，如同正常调用 dlopen
+```
+
+### 6. hook 卸载 (`hook_remove` / `Interceptor.detachAll`)
+
+```
+hook_remove(target)
+  ├─ stealth → wxshadow_release (恢复原始视图)
+  ├─ 非 stealth → proc_mem_write 恢复原始 20 字节; 失败则 mprotect+memcpy
+  ├─ flush icache
+  └─ entry 移入 free_list (pool 内的 trampoline/thunk 空间保留复用)
+```
+
+`JSEngine::drop` → `cleanup_hooks()` + `cleanup_interceptor_hooks()` → 逐个 `hook_remove`。
+
+`reloadjs` 命令: drop 旧引擎 (卸载全部 hook) → 创建新引擎 → eval 新脚本。
+
+### 7. 日志体系
+
+- **hook_engine.c**: `HOOK_LOGI` / `HOOK_LOGW` — Android 走 `__android_log_print` (tag: `XiaM-hook`)，非 Android 走 stderr
+- **lib.rs pool 分配**: `eprintln!` (stderr)
+- logcat 过滤: `adb logcat -s XiaM-hook:* XiaM:*`
+
+## Zymbiote Route A — 注入生命周期
+
+完整的 ptrace-free 注入流程（`examples/zymbiote/`），已在 Redmi rubens 设备验证通过。
+
+### 阶段 1: 注入器准备 (xiam-zymbiote 进程, root)
+
+```
+xiam-zymbiote (REPL: start <pkg>)
+  │
+  ├─ 1. 找 Zygote64 PID (解析 /proc/*/cmdline 找 "zygote64")
+  ├─ 2. 解析 pkg 的 UID (pm list packages -U)
+  ├─ 3. SIGSTOP 冻结 Zygote
+  ├─ 4. 打开 /proc/<zpid>/mem (O_RDWR)
+  ├─ 5. 扫描 /proc/<zpid>/maps:
+  │     ├─ 找 libstagefright.so 的 r-xp 映射 → shellcode 目标
+  │     ├─ 解析 ELF PT_LOAD 的 p_filesz → 计算 text 段末尾 NUL padding
+  │     │   padding ≥ 348B → 使用 ELF padding（不覆盖真实代码）
+  │     │   padding 不足 → 降级使用 last page（可能覆盖代码）
+  │     ├─ 找 libandroid_runtime.so → 解析 setArgV0Native 符号偏移
+  │     └─ 收集 rw 区域（boot.art / dalvik / anon）用于 ArtMethod 搜索
+  ├─ 6. 搜索 ArtMethod slot:
+  │     ├─ 在 rw 区域中搜索 setArgV0Native 地址的 8 字节匹配
+  │     └─ 找到的地址即为 ArtMethod.entry_point_ 字段
+  ├─ 7. 创建抽象 Unix socket @xiam_zymbiote 监听
+  └─ 8. 安装 hook: pwrite 到 Zygote 内存
+        ├─ 备份原始数据 (shellcode 区 + ArtMethod slot)
+        ├─ 填充 payload (stub.S 机器码 + StubParams 参数)
+        ├─ pwrite payload → libstagefright ELF padding 区
+        └─ pwrite shellcode 地址 → ArtMethod.entry_point_ slot
+```
+
+### 阶段 2: 触发 (Zygote fork → app 进程)
+
+```
+Zygote fork → com.tencent.token (PID 24502)
+  │
+  ├─ app 启动 → 调用 Process.setArgV0(pkg_name)
+  │   → ART 查找 ArtMethod → entry_point_ 已被替换为 shellcode 地址
+  │   → CPU 跳到 libstagefright ELF padding 区的 stub.S
+  │
+  ├─ stub.S 执行 (ARM64 shellcode, 348 bytes):
+  │     ├─ 检查 UID == 目标 UID (否则跳过，恢复原函数)
+  │     ├─ 恢复 ArtMethod slot 为原始值 (自我清理)
+  │     ├─ socket(AF_UNIX, SOCK_STREAM) → connect(@xiam_zymbiote)
+  │     ├─ write(4 字节 PID) → 通知注入器
+  │     ├─ read(1 字节) → 等待注入完成信号
+  │     ├─ close socket
+  │     └─ 跳回原始 setArgV0Native 函数
+  │
+  └─ 注入器收到 PID 通知 → 进入阶段 3
+```
+
+### 阶段 3: Agent 注入 (ptrace + memfd)
+
+```
+注入器 listener 线程:
+  │
+  ├─ 1. ptrace attach 到 app PID
+  ├─ 2. 解析双方 libc/libdl 基址 → 计算远程函数地址
+  ├─ 3. remote memfd_create("jit-cache", MFD_CLOEXEC) → fd=N
+  ├─ 4. 从注入器侧直接写入 /proc/<pid>/fd/N (root 权限)
+  │     → 写入 libXiaM.so 全部内容 (~1.7MB)
+  ├─ 5. remote dlopen("/proc/self/fd/N", RTLD_NOW)
+  │     → 触发 .init_array → agent start_agent("init_array")
+  ├─ 6. remote dlsym(handle, "hello_entry")
+  ├─ 7. remote pthread_create(hello_entry) + pthread_detach
+  ├─ 8. ptrace detach
+  └─ 9. write(0x01) 到 stub socket → stub 继续执行
+```
+
+### 阶段 4: Agent 运行 (app 进程内)
+
+```
+agent init_array 触发:
+  │
+  ├─ 1. start_agent("init_array")  (Once 保证只执行一次)
+  │     ├─ logcat: "libXiaM.so loaded via init_array"
+  │     ├─ 启动通信线程 (名: "pool-2-thread-1")
+  │     └─ spawn 屏障阻塞主线程 (Condvar, 5s 超时)
+  │
+  ├─ 2. 通信线程 TCP connect 127.0.0.1:12708 (经 adb reverse)
+  │     ├─ 发送 Hello { pid, version, capabilities, spawn=true }
+  │     └─ 进入请求/响应循环
+  │
+  ├─ 3. host 收到 spawn=true → 自动 loadjs + resume
+  │     ├─ loadjs: get_or_init_engine() → 初始化 hook pool
+  │     │          eval(test.js) → Interceptor.attach(dlopen, ...) → hook_attach
+  │     └─ resume: signal_resume() → Condvar notify → 主线程继续
+  │
+  └─ 4. app 主线程恢复执行
+        ├─ 后续所有 dlopen/android_dlopen_ext 调用被 hook 拦截
+        ├─ on_enter JS 回调 → console.log → 推送到 host 显示
+        └─ 断线自动重连 (TCP 重连循环)
+```
+
+### 清理和恢复
+
+```
+xiam-zymbiote 退出时 (exit/quit/Ctrl+C):
+  ├─ Injector::restore()
+  │     ├─ SIGSTOP Zygote
+  │     ├─ pwrite 恢复 ArtMethod slot 原始值
+  │     ├─ pwrite 恢复 shellcode 区原始数据
+  │     └─ SIGCONT Zygote
+  ├─ shutdown listener socket → listener 线程退出
+  ├─ 删除状态文件 /data/local/tmp/.xiam-state
+  └─ Injector::drop (close fds)
+
+异常恢复 (zymbiote 崩溃后):
+  ├─ 状态文件 /data/local/tmp/.xiam-state 保存了 zpid/slot/shell/orig 数据
+  └─ 重新运行 xiam-zymbiote → stop → restore_from_state() → 恢复 Zygote
+```
+
+## 反检测措施 (当前状态)
+
+- **Pool 权限**: root 设备上 pool 为 rwxp (mmap RWX)；日志明确标识降级路径
+- **HookEntry 堆分配**: entry 用 malloc，不在 pool 中
+- **线程名伪装**: agent 线程名 "pool-2-thread-1" (模仿 Java 线程池)
+- **memfd 注入**: maps 显示 `/memfd:jit-cache (deleted)` (Route A 用 "jit-cache")
+- **NativePointer AtomicU32**: NATIVE_POINTER_CLASS_ID 用 static AtomicU32
+- **ELF padding shellcode**: 不覆盖真实代码，binder 线程不会 SIGILL
+- **日志透明**: hook 引擎所有 fallback 路径有 LOGW 日志
 
 ### 尚存的可检测指纹
 - TCP localhost:12708 通信
-- 1MB 匿名 r-xp 段 (hook pool)
-- logcat 标签 "XiaM"
-- `/memfd:xiam (deleted)` maps 条目名称
+- 1MB 匿名 rwxp 段 (hook pool, root 设备)
+- logcat 标签 "XiaM" / "XiaM-hook"
+- `/memfd:jit-cache (deleted)` maps 条目
 
 ## 已知缺陷
 
 ### P0 — 功能
-1. **新注入器未实际测试** — ptrace+memfd injector 代码完成但未在设备上验证
-2. **agent 命令大量 stub** — list_modules/list_threads/find_symbol/read_memory/trace 均 NotImplemented
+1. **agent 命令大量 stub** — list_modules/list_threads/find_symbol/read_memory/trace 均 NotImplemented
 
 ### P1 — 安全/隐蔽
-3. **memfd 名称可改进** — "xiam" 仍有特征，可改为空名或伪装
-4. **TCP 端口固定** — 12708 未随机化
-5. **logcat tag "XiaM"** — 应替换为无特征名
+2. **memfd 名称可改进** — "jit-cache" 仍有特征，可改为空名或伪装
+3. **TCP 端口固定** — 12708 未随机化
+4. **logcat tag "XiaM"** — 应替换为无特征名
+5. **pool 为 rwxp** — root 设备上为了避免 proc/self/mem 问题使用 RWX，是较大的特征
 
 ### P2 — 工程
 6. **无 Interceptor.detach(单个)** — 只有 detachAll
 7. **quickjs-hook 无测试** — JS API 层无单元测试
 8. **ldmonitor 未完成** — 需要 bpf-linker, 编译未通过
-9. **loader.o 残留** — `examples/injector/loader/loader.o` 应加入 .gitignore
 
 ## 开发路线图
 
 ### 已完成 ✅
 - Phase 1: 结构化协议 + Hello 握手 + TCP 自动重连
 - Phase 3 (部分): QuickJS + Frida 风格 JS API + ARM64 inline hook + 热加载
-- 反检测: RWX 消除 + 线程伪装 + NativePointer 修复
-- 注入: Zymbiote (旧) + ptrace+memfd (新)
+- 反检测: RWX pool + 线程伪装 + NativePointer 修复
+- 注入 Route A (Zymbiote): ELF padding 放置 + ptrace memfd 远程注入 — **设备验证通过**
+- Hook engine: pool_write fallback + 全链路日志 + double-panic 修复
 
 ### 下一步
-1. **设备验证 ptrace+memfd 注入器** — 推送 xiam-inject + libXiaM.so, 对目标进程执行完整注入流程
-2. **修复注入器实际问题** — 根据设备测试结果修复 (预期: 偏移计算/shellcode 执行/socket 连接)
-3. **减少可检测指纹** — memfd 名称伪装、TCP 端口随机化、logcat tag 替换
-4. **实现剩余 agent 命令** — list_modules 复用 Process.enumerateModules, find_symbol 复用 Module.findExportByName
-5. **Interceptor.detach(handle)** — 单个 hook 卸载
+1. **减少可检测指纹** — memfd 名称伪装、TCP 端口随机化、logcat tag 替换
+2. **实现剩余 agent 命令** — list_modules 复用 Process.enumerateModules, find_symbol 复用 Module.findExportByName
+3. **Interceptor.detach(handle)** — 单个 hook 卸载
+4. **pool 权限优化** — 探索 dual-mapping (一份 RW + 一份 R-X 共享物理页) 消除 rwxp
 
 ### 远期
 - Phase 2: host 拆分 (core / CLI / MCP)

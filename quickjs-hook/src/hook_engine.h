@@ -57,7 +57,8 @@ typedef struct HookEntry {
 
 /* Global hook engine state */
 typedef struct {
-    void* exec_mem;                 /* Executable memory pool */
+    void* exec_mem;                 /* Executable memory pool (R-X view) */
+    void* exec_mem_rw;              /* Writable view (dual-mapping), NULL if N/A */
     size_t exec_mem_size;           /* Total pool size */
     size_t exec_mem_used;           /* Used bytes */
     HookEntry* hooks;               /* Linked list of hooks */
@@ -70,11 +71,13 @@ typedef struct {
 /*
  * Initialize the hook engine
  *
- * @param exec_mem      Pointer to executable memory pool (mapped R-X)
+ * @param exec_mem      Pointer to executable memory pool (R-X view)
+ * @param rw_mem        Pointer to writable view of the same pool (dual-mapping),
+ *                      or NULL to use /proc/self/mem or mprotect toggle.
  * @param size          Size of the memory region
  * @return              0 on success, -1 on failure
  */
-int hook_engine_init(void* exec_mem, size_t size);
+int hook_engine_init(void* exec_mem, void* rw_mem, size_t size);
 
 /*
  * Install a simple replacement hook

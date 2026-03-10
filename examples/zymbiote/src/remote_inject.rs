@@ -67,8 +67,8 @@ pub fn inject_memfd(pid: i32, agent_so: &[u8]) -> Result<(), String> {
         Ok(addr)
     };
 
-    // ---- 3. remote memfd_create("jit-cache", MFD_CLOEXEC) ----
-    let name = b"jit-cache\0";
+    // ---- 3. remote memfd_create("xm-jit-cache", MFD_CLOEXEC) ----
+    let name = b"xm-jit-cache\0";
     let name_addr = write_str(name)?;
     let memfd = ptrace::call_remote_function(
         pid,
