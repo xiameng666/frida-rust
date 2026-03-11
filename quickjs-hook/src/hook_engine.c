@@ -107,12 +107,12 @@ static inline void* hook_memset(void* dst, int c, size_t n) {
     return dst;
 }
 
-/* wxshadow prctl operations */
+/* wxjump prctl operations (wxshadow 0x575858xx) */
 #ifndef PR_WXSHADOW_PATCH
-#define PR_WXSHADOW_PATCH   0x5758
+#define PR_WXSHADOW_PATCH   0x57585804
 #endif
 #ifndef PR_WXSHADOW_RELEASE
-#define PR_WXSHADOW_RELEASE 0x5759
+#define PR_WXSHADOW_RELEASE 0x57585805
 #endif
 
 /* Global engine state */
