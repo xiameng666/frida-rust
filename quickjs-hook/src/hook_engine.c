@@ -582,7 +582,9 @@ void* hook_install(void* target, void* replacement, int stealth) {
     }
 
     /* Flush cache */
-    hook_flush_cache(target, MIN_HOOK_SIZE);
+    if (!entry->stealth) {
+        hook_flush_cache(target, MIN_HOOK_SIZE);
+    }
     hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
 
     /* Add to list */
@@ -827,7 +829,9 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     }
 
     /* Flush caches */
-    hook_flush_cache(target, MIN_HOOK_SIZE);
+    if (!entry->stealth) {
+        hook_flush_cache(target, MIN_HOOK_SIZE);
+    }
     hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
     hook_flush_cache(thunk_mem, thunk_size);
 
@@ -871,7 +875,6 @@ int hook_remove(void* target) {
                 }
                 hook_flush_cache(target, entry->original_size);
             }
-            hook_flush_cache(target, entry->original_size);
 
             /* Remove from hook list */
             if (prev) {
@@ -916,8 +919,8 @@ void hook_engine_cleanup(void) {
             wxshadow_release(entry->target, entry->original_size);
         } else {
             target_write(entry->target, entry->original_bytes, entry->original_size);
+            hook_flush_cache(entry->target, entry->original_size);
         }
-        hook_flush_cache(entry->target, entry->original_size);
         HookEntry* next = entry->next;
         free(entry);
         entry = next;
