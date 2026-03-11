@@ -156,7 +156,7 @@ unsafe extern "C" fn on_leave_wrapper(
     retval.free(ctx);
 }
 
-/// JS: Interceptor.attach(target, { onEnter, onLeave })
+/// JS: Interceptor.attach(target, { onEnter, onLeave }, stealth?)
 unsafe extern "C" fn js_interceptor_attach(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -172,6 +172,13 @@ unsafe extern "C" fn js_interceptor_attach(
 
     let ptr_arg = JSValue(*argv);
     let callbacks_arg = JSValue(*argv.add(1));
+
+    // Optional 3rd arg: stealth mode (wxshadow)
+    let stealth = if argc >= 3 {
+        JSValue(*argv.add(2)).to_bool().unwrap_or(false)
+    } else {
+        false
+    };
 
     // 获取目标地址
     let addr = match get_native_pointer_addr(ctx, ptr_arg) {
@@ -274,7 +281,7 @@ unsafe extern "C" fn js_interceptor_attach(
         c_on_enter,
         c_on_leave,
         addr as *mut std::ffi::c_void, // user_data = target addr
-        0, // 不使用 stealth
+        if stealth { 1 } else { 0 },
     );
 
     if result != HOOK_OK {
@@ -344,10 +351,10 @@ pub fn register_interceptor(ctx: &JSContext) {
     let interceptor = ctx.new_object();
 
     unsafe {
-        // Interceptor.attach(target, callbacks)
+        // Interceptor.attach(target, callbacks, stealth?)
         let cname = CString::new("attach").unwrap();
         let func_val =
-            ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_interceptor_attach), cname.as_ptr(), 2);
+            ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_interceptor_attach), cname.as_ptr(), 3);
         let atom = ffi::JS_NewAtom(ctx.as_ptr(), cname.as_ptr());
         ffi::qjs_set_property(ctx.as_ptr(), interceptor.raw(), atom, func_val);
         ffi::JS_FreeAtom(ctx.as_ptr(), atom);

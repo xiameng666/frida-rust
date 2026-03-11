@@ -8,6 +8,7 @@ pub mod module_api;
 pub mod process;
 pub mod ptr;
 pub mod send;
+pub mod wxshadow;
 
 pub use console::register_console;
 pub use hook_api::register_hook_api;
@@ -17,6 +18,7 @@ pub use module_api::register_module_api;
 pub use process::register_process;
 pub use ptr::register_ptr;
 pub use send::register_send;
+pub use wxshadow::register_wxshadow;
 
 use crate::context::JSContext;
 
@@ -30,4 +32,5 @@ pub fn register_all_apis(ctx: &JSContext) {
     register_module_api(ctx);
     register_process(ctx);
     register_send(ctx);
+    register_wxshadow(ctx);
 }

@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Linux mm_struct 深度解析</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', 'PingFang SC', sans-serif;
+    background: #0d1117;
+    color: #e6edf3;
+    overflow-x: hidden;
+  }
+
+  /* ── 顶部标题 ── */
+  .hero {
+    background: linear-gradient(135deg, #1a1f2e 0%, #0d1117 100%);
+    border-bottom: 1px solid #21262d;
+    padding: 48px 40px 32px;
+    text-align: center;
+  }
+  .hero h1 { font-size: 2.4em; color: #58a6ff; letter-spacing: -1px; }
+  .hero p  { color: #8b949e; margin-top: 10px; font-size: 1.1em; }
+  .badge {
+    display: inline-block; background: #1f6feb33; color: #58a6ff;
+    border: 1px solid #1f6feb; border-radius: 20px;
+    padding: 3px 12px; font-size: 0.8em; margin: 8px 4px;
+  }
+
+  /* ── 导航 ── */
+  nav {
+    position: sticky; top: 0; z-index: 100;
+    background: #161b22; border-bottom: 1px solid #21262d;
+    display: flex; gap: 0; overflow-x: auto; padding: 0 20px;
+  }
+  nav button {
+    background: none; border: none; color: #8b949e;
+    padding: 14px 20px; cursor: pointer; font-size: 0.9em;
+    border-bottom: 2px solid transparent; white-space: nowrap;
+    transition: all .2s;
+  }
+  nav button:hover  { color: #e6edf3; }
+  nav button.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+
+  /* ── 主内容 ── */
+  .section { display: none; padding: 40px; max-width: 1100px; margin: 0 auto; }
+  .section.active { display: block; animation: fadeIn .3s ease; }
+  @keyframes fadeIn { from { opacity:0; transform: translateY(8px); } to { opacity:1; transform: none; } }
+
+  h2 { color: #58a6ff; font-size: 1.6em; margin-bottom: 20px; }
+  h3 { color: #79c0ff; font-size: 1.2em; margin: 24px 0 12px; }
+  p  { color: #c9d1d9; line-height: 1.8; margin-bottom: 12px; }
+
+  /* ── 代码块 ── */
+  .code-block {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 20px; font-family: 'Consolas', monospace; font-size: 0.88em;
+    overflow-x: auto; line-height: 1.7; margin: 16px 0;
+  }
+  .code-block .kw  { color: #ff7b72; }
+  .code-block .ty  { color: #ffa657; }
+  .code-block .cm  { color: #8b949e; font-style: italic; }
+  .code-block .str { color: #a5d6ff; }
+  .code-block .num { color: #79c0ff; }
+  .code-block .fn  { color: #d2a8ff; }
+
+  /* ── 信息卡片 ── */
+  .info-box {
+    border-left: 3px solid #58a6ff; background: #1c2128;
+    padding: 14px 18px; border-radius: 0 8px 8px 0; margin: 16px 0;
+  }
+  .warn-box {
+    border-left: 3px solid #f0883e; background: #1c2128;
+    padding: 14px 18px; border-radius: 0 8px 8px 0; margin: 16px 0;
+  }
+  .ok-box {
+    border-left: 3px solid #3fb950; background: #1c2128;
+    padding: 14px 18px; border-radius: 0 8px 8px 0; margin: 16px 0;
+  }
+
+  /* ════════════════════════════════════════
+     ① 进程内存布局动画图
+  ════════════════════════════════════════ */
+  .layout-demo {
+    display: flex; gap: 24px; flex-wrap: wrap; margin: 24px 0;
+  }
+  .mem-region {
+    flex: 1; min-width: 200px; border-radius: 10px; overflow: hidden;
+    border: 1px solid #30363d; animation: slideUp .5s ease both;
+  }
+  .mem-region:nth-child(1){ animation-delay:.1s }
+  .mem-region:nth-child(2){ animation-delay:.2s }
+  .mem-region:nth-child(3){ animation-delay:.3s }
+  .mem-region:nth-child(4){ animation-delay:.4s }
+  @keyframes slideUp { from { opacity:0; transform: translateY(20px) } to { opacity:1; transform:none } }
+  .mem-header {
+    padding: 10px 16px; font-weight: bold; font-size: 0.85em;
+    text-transform: uppercase; letter-spacing: .5px;
+  }
+  .mem-addr {
+    font-family: monospace; font-size: 0.78em; padding: 4px 16px 10px;
+    opacity: .6;
+  }
+  .mem-body { padding: 12px 16px; }
+  .mem-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 0; border-bottom: 1px solid #21262d; font-size: 0.85em;
+  }
+  .mem-row:last-child { border: none; }
+  .mem-row .label { color: #8b949e; }
+  .mem-row .val   { font-family: monospace; color: #a5d6ff; }
+
+  .region-stack   { background: #1a1a2e; } .region-stack   .mem-header { background: #2d1b69; color: #d2a8ff; }
+  .region-heap    { background: #1a2a1a; } .region-heap    .mem-header { background: #1a4a1a; color: #3fb950; }
+  .region-code    { background: #1a2a3a; } .region-code    .mem-header { background: #0d3a5c; color: #58a6ff; }
+  .region-kernel  { background: #2a1a1a; } .region-kernel  .mem-header { background: #5c1a1a; color: #ff7b72; }
+
+  /* ════════════════════════════════════════
+     ② task_struct → mm_struct 关系图
+  ════════════════════════════════════════ */
+  .struct-graph {
+    display: flex; align-items: flex-start; gap: 8px;
+    flex-wrap: wrap; margin: 24px 0;
+  }
+  .struct-box {
+    background: #1c2128; border: 1px solid #30363d; border-radius: 10px;
+    min-width: 220px; overflow: hidden;
+  }
+  .struct-title {
+    background: #21262d; padding: 10px 16px; font-weight: bold;
+    font-size: 0.9em; display: flex; align-items: center; gap: 8px;
+  }
+  .struct-title .icon { font-size: 1.2em; }
+  .struct-field {
+    padding: 8px 16px; font-size: 0.83em; font-family: monospace;
+    border-bottom: 1px solid #21262d; display: flex;
+    justify-content: space-between; cursor: pointer;
+    transition: background .15s;
+  }
+  .struct-field:last-child { border: none; }
+  .struct-field:hover { background: #2d333b; }
+  .struct-field .fname { color: #ffa657; }
+  .struct-field .ftype { color: #8b949e; }
+  .struct-field.highlight { background: #1f3a1f; border-left: 3px solid #3fb950; }
+  .struct-field.highlight .fname { color: #3fb950; }
+  .struct-field.warn { background: #3a1f1f; border-left: 3px solid #f0883e; }
+  .struct-field.warn .fname { color: #f0883e; }
+  .struct-field.blue { background: #1a2a3a; border-left: 3px solid #58a6ff; }
+  .struct-field.blue .fname { color: #58a6ff; }
+
+  .arrow-h {
+    align-self: center; color: #58a6ff; font-size: 1.8em; padding: 0 4px;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* ════════════════════════════════════════
+     ③ ASID / TTBR0 动画
+  ════════════════════════════════════════ */
+  .ttbr0-vis {
+    background: #1c2128; border: 1px solid #30363d; border-radius: 10px;
+    padding: 24px; margin: 20px 0;
+  }
+  .ttbr0-bits {
+    display: flex; border: 1px solid #30363d; border-radius: 6px;
+    overflow: hidden; margin: 16px 0; font-family: monospace;
+  }
+  .bit-group {
+    text-align: center; padding: 12px 0; flex: 1;
+    border-right: 1px solid #30363d; cursor: pointer;
+    transition: background .2s;
+  }
+  .bit-group:last-child { border: none; }
+  .bit-group .bit-range { font-size: 0.7em; color: #8b949e; }
+  .bit-group .bit-name  { font-size: 0.85em; font-weight: bold; margin-top: 4px; }
+  .bit-group .bit-val   { font-size: 0.8em; color: #a5d6ff; margin-top: 2px; }
+  .bit-group.asid  { background: #1f3a5c; }
+  .bit-group.asid  .bit-name { color: #58a6ff; }
+  .bit-group.pgd   { background: #1a3a1a; }
+  .bit-group.pgd   .bit-name { color: #3fb950; }
+  .bit-group.cnp   { background: #3a1a1a; }
+  .bit-group.cnp   .bit-name { color: #f0883e; }
+  .bit-group:hover { filter: brightness(1.3); }
+
+  .context-id-vis {
+    display: flex; border: 1px solid #30363d; border-radius: 6px;
+    overflow: hidden; margin: 12px 0; font-family: monospace;
+  }
+
+  /* ════════════════════════════════════════
+     ④ 偏移量扫描动画
+  ════════════════════════════════════════ */
+  .scan-demo {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 20px; margin: 20px 0;
+  }
+  .scan-title { color: #8b949e; font-size: 0.85em; margin-bottom: 12px; }
+  .scan-rows { display: flex; flex-direction: column; gap: 2px; }
+  .scan-row {
+    display: flex; align-items: center; gap: 12px; padding: 7px 12px;
+    border-radius: 5px; font-family: monospace; font-size: 0.83em;
+    transition: all .3s;
+  }
+  .scan-row .s-off  { color: #79c0ff; min-width: 60px; }
+  .scan-row .s-val  { color: #a5d6ff; min-width: 180px; }
+  .scan-row .s-note { color: #8b949e; }
+  .scan-row.scanning { background: #1f2937; animation: scanAnim .6s ease infinite alternate; }
+  .scan-row.match    { background: #1f3a1f; }
+  .scan-row.match    .s-note { color: #3fb950; font-weight: bold; }
+  @keyframes scanAnim { from{background:#1f2937} to{background:#2d333b} }
+
+  #scan-btn {
+    background: #238636; color: white; border: none; padding: 10px 24px;
+    border-radius: 6px; cursor: pointer; font-size: 0.9em; margin-top: 16px;
+    transition: background .2s;
+  }
+  #scan-btn:hover { background: #2ea043; }
+  #scan-btn:disabled { background: #21262d; color: #8b949e; cursor: not-allowed; }
+
+  /* ════════════════════════════════════════
+     ⑤ wxshadow 需要 mm 的场景
+  ════════════════════════════════════════ */
+  .scenario-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px; margin: 20px 0;
+  }
+  .scenario-card {
+    background: #1c2128; border: 1px solid #30363d; border-radius: 10px;
+    padding: 20px; transition: border-color .2s, transform .2s;
+    animation: slideUp .5s ease both;
+  }
+  .scenario-card:hover { border-color: #58a6ff; transform: translateY(-2px); }
+  .scenario-card:nth-child(1){ animation-delay:.1s }
+  .scenario-card:nth-child(2){ animation-delay:.2s }
+  .scenario-card:nth-child(3){ animation-delay:.3s }
+  .scenario-card:nth-child(4){ animation-delay:.4s }
+  .scenario-card .sc-icon { font-size: 2em; margin-bottom: 10px; }
+  .scenario-card .sc-title { color: #58a6ff; font-weight: bold; margin-bottom: 8px; }
+  .scenario-card .sc-text { color: #8b949e; font-size: 0.88em; line-height: 1.6; }
+  .scenario-card .sc-code { font-family: monospace; font-size: 0.8em; color: #ffa657; margin-top: 10px; }
+
+  /* ════════════════════════════════════════
+     AOSP 文件路径表
+  ════════════════════════════════════════ */
+  .file-table {
+    width: 100%; border-collapse: collapse; margin: 16px 0;
+    font-size: 0.88em;
+  }
+  .file-table th {
+    background: #21262d; padding: 10px 16px; text-align: left;
+    color: #8b949e; font-weight: 600; border-bottom: 1px solid #30363d;
+  }
+  .file-table td {
+    padding: 10px 16px; border-bottom: 1px solid #21262d; vertical-align: top;
+  }
+  .file-table tr:last-child td { border: none; }
+  .file-table tr:hover td { background: #21262d; }
+  .file-table .path { font-family: monospace; color: #a5d6ff; }
+  .file-table .desc { color: #c9d1d9; }
+  .file-table .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 0.78em; font-weight: bold;
+  }
+  .tag-core   { background: #1f3a5c; color: #58a6ff; border: 1px solid #1f6feb; }
+  .tag-arm64  { background: #1f3a1f; color: #3fb950; border: 1px solid #238636; }
+  .tag-mtk    { background: #3a1a3a; color: #d2a8ff; border: 1px solid #8957e5; }
+
+  /* 分隔线 */
+  hr { border: none; border-top: 1px solid #21262d; margin: 28px 0; }
+
+  /* tooltip */
+  [data-tip] { position: relative; cursor: help; border-bottom: 1px dashed #8b949e; }
+  [data-tip]:hover::after {
+    content: attr(data-tip);
+    position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+    background: #2d333b; border: 1px solid #30363d; border-radius: 6px;
+    padding: 6px 10px; font-size: 0.78em; color: #e6edf3; white-space: nowrap;
+    z-index: 10; margin-bottom: 6px;
+  }
+
+  /* 响应式 */
+  @media(max-width:700px){
+    .section{padding:20px 16px;}
+    .struct-graph{flex-direction:column;}
+    .arrow-h{transform:rotate(90deg);}
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>🧠 Linux mm_struct 深度解析</h1>
+  <p>理解进程内存管理、ASID、TTBR0 与 wxshadow 无痕 hook 的关系</p>
+  <div>
+    <span class="badge">Linux 5.10</span>
+    <span class="badge">ARM64</span>
+    <span class="badge">Android</span>
+    <span class="badge">MediaTek</span>
+  </div>
+</div>
+
+<nav>
+  <button class="active" onclick="show('s1',this)">① 什么是 mm_struct</button>
+  <button onclick="show('s2',this)">② 结构体字段详解</button>
+  <button onclick="show('s3',this)">③ ASID &amp; TTBR0</button>
+  <button onclick="show('s4',this)">④ 偏移量扫描原理</button>
+  <button onclick="show('s5',this)">⑤ wxshadow 为什么需要它</button>
+  <button onclick="show('s6',this)">⑥ AOSP 源码位置</button>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════
+     ① 什么是 mm_struct
+════════════════════════════════════════════════════════ -->
+<div id="s1" class="section active">
+  <h2>① 什么是 mm_struct？</h2>
+  <p>
+    在 Linux 内核中，每个<strong>用户态进程</strong>都有一个唯一的
+    <code>mm_struct</code>（Memory Management Structure，内存管理描述符）。
+    它是内核用来描述、管理该进程<strong>全部虚拟地址空间</strong>的核心数据结构。
+  </p>
+
+  <div class="info-box">
+    <strong>一句话理解：</strong>
+    <code>mm_struct</code> 就是内核眼中一个进程的"地图"——记录了这个进程占用了哪些虚拟内存、
+    页表在哪里、ASID 是多少等一切内存相关信息。
+  </div>
+
+  <h3>进程虚拟地址空间（ARM64，4KB 页）</h3>
+  <div class="layout-demo">
+    <div class="mem-region region-kernel">
+      <div class="mem-header">内核空间</div>
+      <div class="mem-addr">0xFFFF000000000000 – 0xFFFFFFFFFFFFFFFF</div>
+      <div class="mem-body">
+        <div class="mem-row"><span class="label">内核代码/数据</span><span class="val">不可见于用户</span></div>
+        <div class="mem-row"><span class="label">mm_struct 就在这里</span><span class="val">↑ 你要找的</span></div>
+      </div>
+    </div>
+    <div class="mem-region region-stack">
+      <div class="mem-header">Stack (栈)</div>
+      <div class="mem-addr">高地址，向下增长</div>
+      <div class="mem-body">
+        <div class="mem-row"><span class="label">局部变量</span><span class="val">可读写</span></div>
+        <div class="mem-row"><span class="label">函数调用帧</span><span class="val">可执行×</span></div>
+      </div>
+    </div>
+    <div class="mem-region region-heap">
+      <div class="mem-header">Heap (堆)</div>
+      <div class="mem-addr">向上增长</div>
+      <div class="mem-body">
+        <div class="mem-row"><span class="label">malloc/new</span><span class="val">可读写</span></div>
+        <div class="mem-row"><span class="label">匿名映射</span><span class="val">可执行×</span></div>
+      </div>
+    </div>
+    <div class="mem-region region-code">
+      <div class="mem-header">Code / .so</div>
+      <div class="mem-addr">低地址区域</div>
+      <div class="mem-body">
+        <div class="mem-row"><span class="label">.text 段</span><span class="val">可执行</span></div>
+        <div class="mem-row"><span class="label">.rodata 段</span><span class="val">只读</span></div>
+        <div class="mem-row"><span class="label">.data 段</span><span class="val">可读写</span></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>task_struct → mm_struct 的关系</h3>
+  <p>
+    每个线程有一个 <code>task_struct</code>，主线程的 <code>task_struct.mm</code>
+    指向进程的 <code>mm_struct</code>。内核线程（如 swapper/0）没有用户地址空间，所以
+    <code>mm == NULL</code>，只有 <code>active_mm</code> 有值。
+  </p>
+  <div class="struct-graph">
+    <div class="struct-box">
+      <div class="struct-title"><span class="icon">🧵</span>task_struct（每个线程一个）</div>
+      <div class="struct-field blue">
+        <span class="fname">mm</span>
+        <span class="ftype">*mm_struct</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">active_mm</span>
+        <span class="ftype">*mm_struct</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">comm</span>
+        <span class="ftype">char[16]</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">pid / tgid</span>
+        <span class="ftype">pid_t</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">tasks</span>
+        <span class="ftype">list_head</span>
+      </div>
+    </div>
+    <div class="arrow-h">→</div>
+    <div class="struct-box">
+      <div class="struct-title"><span class="icon">🗺️</span>mm_struct（每个进程一个）</div>
+      <div class="struct-field highlight">
+        <span class="fname">pgd</span>
+        <span class="ftype">pgd_t*  ← 页表根</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">mmap</span>
+        <span class="ftype">*vm_area_struct</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">start_code / end_code</span>
+        <span class="ftype">unsigned long</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">start_stack</span>
+        <span class="ftype">unsigned long</span>
+      </div>
+      <div class="struct-field warn">
+        <span class="fname">context</span>
+        <span class="ftype">mm_context_t</span>
+      </div>
+    </div>
+    <div class="arrow-h">→</div>
+    <div class="struct-box">
+      <div class="struct-title"><span class="icon">🔑</span>mm_context_t（ARM64专属）</div>
+      <div class="struct-field warn">
+        <span class="fname">id</span>
+        <span class="ftype">atomic64_t  ← ASID在这</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">vdso</span>
+        <span class="ftype">void*</span>
+      </div>
+      <div class="struct-field">
+        <span class="fname">lock</span>
+        <span class="ftype">spinlock_t</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="warn-box">
+    <strong>⚠️ 内核线程特殊情况：</strong><br>
+    <code>swapper/0</code>（init_task，PID=0）是内核线程，<code>mm == NULL</code>，
+    但 <code>active_mm</code> 指向 <code>&amp;init_mm</code>（一个非空的全局变量）。
+    这就是为什么 KP 框架能检测到 <code>active_mm_offset</code> 却检测不到 <code>mm_offset</code>。
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     ② 结构体字段详解
+════════════════════════════════════════════════════════ -->
+<div id="s2" class="section">
+  <h2>② mm_struct 关键字段详解</h2>
+  <p>点击各字段查看详细说明</p>
+
+  <div class="code-block">
+<span class="cm">// include/linux/mm_types.h</span>
+<span class="kw">struct</span> <span class="ty">mm_struct</span> {
+  <span class="kw">struct</span> {
+    <span class="ty">struct vm_area_struct</span> *<span class="fn">mmap</span>;     <span class="cm">/* VMA 链表头 — 所有内存映射 */</span>
+    <span class="ty">struct rb_root</span>          <span class="fn">mm_rb</span>;     <span class="cm">/* VMA 红黑树（快速查找） */</span>
+    <span class="ty">pgd_t</span>                  *<span class="fn">pgd</span>;       <span class="cm">/* ⭐ 页表根 — 虚拟→物理地址翻译起点 */</span>
+    <span class="ty">atomic_t</span>                <span class="fn">mm_users</span>;   <span class="cm">/* 引用此 mm 的线程数 */</span>
+    <span class="ty">atomic_t</span>                <span class="fn">mm_count</span>;   <span class="cm">/* mm 自身引用计数 */</span>
+    <span class="ty">int</span>                     <span class="fn">map_count</span>;  <span class="cm">/* VMA 总数量 */</span>
+    <span class="ty">unsigned long</span>           <span class="fn">start_code</span>, <span class="fn">end_code</span>;   <span class="cm">/* 代码段范围 */</span>
+    <span class="ty">unsigned long</span>           <span class="fn">start_data</span>, <span class="fn">end_data</span>;   <span class="cm">/* 数据段范围 */</span>
+    <span class="ty">unsigned long</span>           <span class="fn">start_brk</span>,  <span class="fn">brk</span>;       <span class="cm">/* 堆的起止地址 */</span>
+    <span class="ty">unsigned long</span>           <span class="fn">start_stack</span>;               <span class="cm">/* 栈底地址 */</span>
+    <span class="cm">/* ... 还有几十个字段 ... */</span>
+  };
+  <span class="ty">mm_context_t</span>            <span class="fn">context</span>;    <span class="cm">/* ⭐ 架构相关上下文 (ARM64 = ASID 等) */</span>
+};
+
+<span class="cm">// arch/arm64/include/asm/mmu.h</span>
+<span class="kw">typedef struct</span> {
+  <span class="ty">atomic64_t</span>  <span class="fn">id</span>;      <span class="cm">/* ⭐ ASID (地址空间 ID) — 区分不同进程的 TLB 条目 */</span>
+  <span class="kw">void</span>       *<span class="fn">vdso</span>;   <span class="cm">/* vDSO 库映射地址 */</span>
+  <span class="ty">spinlock_t</span>  <span class="fn">lock</span>;   <span class="cm">/* 保护 id 字段的自旋锁 */</span>
+} <span class="ty">mm_context_t</span>;
+  </div>
+
+  <h3>pgd — 页表根，最重要的字段</h3>
+  <div class="info-box">
+    <code>pgd</code> 是<strong>页全局目录</strong>的虚拟地址指针。ARM64 有 4 级页表：
+    <br><br>
+    <code style="color:#58a6ff">pgd</code>
+    <code style="color:#8b949e"> → PUD → PMD → PTE → </code>
+    <code style="color:#3fb950">物理页（4KB）</code>
+    <br><br>
+    CPU 执行用户态代码时，先把 <code>pgd</code> 的<strong>物理地址</strong>写入
+    <code>TTBR0_EL1</code> 寄存器，然后 MMU 自动用它翻译所有虚拟地址。
+  </div>
+
+  <h3>mmap + mm_rb — VMA 管理</h3>
+  <p>
+    进程的每一段内存（.text、.so、stack、heap…）都是一个
+    <code>vm_area_struct (VMA)</code>。<code>mmap</code> 是链表头，
+    <code>mm_rb</code> 是红黑树（O(log n) 查找）。
+    <strong>wxshadow 的 <code>find_vma()</code> 调用就是在查这棵树。</strong>
+  </p>
+
+  <h3>context.id — ASID（地址空间 ID）</h3>
+  <div class="warn-box">
+    <strong>标准 Linux 存储格式：</strong><br>
+    <code>context.id.counter = ASID | (generation &lt;&lt; ASID_BITS)</code><br>
+    低 16 位 = 硬件 ASID，高位 = 代次计数器（ASID 轮回次数）<br><br>
+    <strong>MTK 定制（你的设备）：</strong><br>
+    <code>context.id.counter = 完整 TTBR0 值 = phys_pgd | (ASID &lt;&lt; 48)</code><br>
+    高 16 位 = ASID，低 48 位 = 物理页表地址 + CnP 位
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     ③ ASID & TTBR0
+════════════════════════════════════════════════════════ -->
+<div id="s3" class="section">
+  <h2>③ ASID &amp; TTBR0_EL1 — 为什么进程需要 ID？</h2>
+
+  <p>
+    每次进程切换，CPU 的 TLB（转换后备缓冲区）里还存着旧进程的地址翻译结果。
+    如果不清空 TLB，新进程可能读到错误的物理地址 → 崩溃或安全漏洞。
+  </p>
+  <p>
+    清空整个 TLB 代价很高。ARM64 引入了 <strong>ASID</strong>
+    （Address Space ID），让不同进程的 TLB 条目共存，
+    只需按 ASID 精准无效化，不需要全清。
+  </p>
+
+  <h3>TTBR0_EL1 寄存器结构（来自你的日志 0x0e1800012e50d001）</h3>
+  <div class="ttbr0-vis">
+    <div class="ttbr0-bits">
+      <div class="bit-group asid" data-tip="Address Space ID：唯一标识一个进程的 TLB 条目">
+        <div class="bit-range">bits[63:48]</div>
+        <div class="bit-name">ASID</div>
+        <div class="bit-val">0x0e18 = 3608</div>
+      </div>
+      <div class="bit-group pgd" data-tip="物理页表基地址 bits[47:1]，4KB 对齐">
+        <div class="bit-range">bits[47:1]</div>
+        <div class="bit-name">物理 PGD 基地址</div>
+        <div class="bit-val">0x00012e50d000</div>
+      </div>
+      <div class="bit-group cnp" data-tip="Common not Private：多核共享 TLB 优化位">
+        <div class="bit-range">bit[0]</div>
+        <div class="bit-name">CnP</div>
+        <div class="bit-val">1</div>
+      </div>
+    </div>
+    <div class="info-box">
+      <strong>CPU 切换进程时做了什么：</strong><br>
+      <code>MSR TTBR0_EL1, X0</code>  — 将新进程的 <code>phys_pgd | (ASID&lt;&lt;48)</code> 写入寄存器<br>
+      这一条指令让 MMU 立刻切换到新进程的页表，TLB 中带旧 ASID 的条目自动被忽略
+    </div>
+  </div>
+
+  <h3>MTK 内核的定制：context.id 存储完整 TTBR0</h3>
+  <p>
+    标准内核的 <code>context.id</code> 只存 <code>ASID | generation</code>，
+    而 MTK 为了<strong>加速上下文切换</strong>，直接把完整的 TTBR0 值预计算并缓存在
+    <code>context.id.counter</code> 里：
+  </p>
+  <div class="context-id-vis">
+    <div class="bit-group asid" style="flex:2">
+      <div class="bit-range">bits[63:48]</div>
+      <div class="bit-name">ASID = 0x0e18</div>
+      <div class="bit-val">← 我们需要这里</div>
+    </div>
+    <div class="bit-group pgd" style="flex:6">
+      <div class="bit-range">bits[47:1]</div>
+      <div class="bit-name">物理 PGD 地址</div>
+      <div class="bit-val">bits[16:31] = 0x2e50 ← 原版二进制找的</div>
+    </div>
+    <div class="bit-group cnp" style="flex:1">
+      <div class="bit-range">bit[0]</div>
+      <div class="bit-name">CnP</div>
+      <div class="bit-val">1</div>
+    </div>
+  </div>
+
+  <div class="ok-box">
+    <strong>✅ 修复后的扫描逻辑：</strong>检查 bits[48:63] 是否等于
+    <code>ASID = ttbr0 &gt;&gt; 48</code>。找到后，读 ASID 时用
+    <code>(val &gt;&gt; 48) &amp; 0xFFFF</code> 而不是低 16 位。
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     ④ 偏移量扫描原理
+════════════════════════════════════════════════════════ -->
+<div id="s4" class="section">
+  <h2>④ 为什么要"扫描"偏移量？</h2>
+
+  <p>
+    内核编译时，结构体字段的偏移量会因配置（<code>CONFIG_*</code>）、内核版本、
+    厂商补丁而变化。wxshadow 不能硬编码这些数值，必须在运行时动态检测。
+  </p>
+
+  <div class="info-box">
+    <strong>为什么 KP 框架能检测 active_mm_offset 却检测不到 mm_offset？</strong><br><br>
+    KP 的检测原理：在 <code>init_task</code>（swapper/0）的内存里找一个特定的非空指针。<br>
+    — <code>active_mm</code> 指向 <code>&amp;init_mm</code>（<strong>非空</strong>）→ 可以找到 ✅<br>
+    — <code>mm</code> = NULL（swapper 是内核线程，没有用户内存）→ 找不到 ❌
+  </div>
+
+  <h3>mm_offset 检测方法（我们的修复）</h3>
+  <p>ARM64 Linux 中，<code>task_struct</code> 里 <code>mm</code> 和 <code>active_mm</code> 相邻：</p>
+  <div class="code-block">
+<span class="cm">/* 典型布局（ARM64 Linux 5.10）*/</span>
+offset+<span class="num">0</span>:  <span class="ty">struct mm_struct</span> *mm;         <span class="cm">← 用户进程有mm，内核线程=NULL</span>
+offset+<span class="num">8</span>:  <span class="ty">struct mm_struct</span> *active_mm;  <span class="cm">← 始终非空，指向当前使用的mm</span>
+
+<span class="cm">// 因此: mm_offset = active_mm_offset - 8</span>
+<span class="cm">// 验证: *(init_task + candidate) == 0 (swapper的mm=NULL)</span>
+<span class="cm">//   AND: *(init_task + active_mm_off) >> 48 == 0xFFFF (有效内核指针)</span>
+  </div>
+
+  <h3>context.id 偏移扫描动画</h3>
+  <p>扫描 <code>mm_struct</code> 偏移 256~1024，寻找 ASID=<strong>0x0e18</strong>：</p>
+  <div class="scan-demo">
+    <div class="scan-title">mm_struct 内存扫描（每行 8 字节）</div>
+    <div class="scan-rows" id="scan-rows"></div>
+    <button id="scan-btn" onclick="runScan()">▶ 开始扫描</button>
+  </div>
+
+  <div class="info-box">
+    <strong>扫描到 0x0e18 出现在 bits[48:63] 时：找到！</strong><br>
+    这说明该字段存储的是完整 TTBR0 值（MTK 定制）。
+    记录 <code>wx_mm_context_id_offset</code> 和 <code>wx_mm_context_id_asid_shift = 48</code>。
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     ⑤ wxshadow 为什么需要 mm
+════════════════════════════════════════════════════════ -->
+<div id="s5" class="section">
+  <h2>⑤ wxshadow 在哪里用到 mm_struct？</h2>
+  <p>
+    wxshadow 的无痕 hook 本质是<strong>影子页技术</strong>：
+    用两个物理页（原始页 + 影子页）通过修改页表（PTE）在同一虚拟地址上切换。
+    这一切都需要通过 mm_struct 来操作。
+  </p>
+
+  <div class="scenario-grid">
+    <div class="scenario-card">
+      <div class="sc-icon">🗺️</div>
+      <div class="sc-title">查找 VMA</div>
+      <div class="sc-text">
+        设置 hook 时，用 <code>find_vma(mm, addr)</code> 确认地址属于哪个
+        VMA，获取 VMA 的起止范围。
+      </div>
+      <div class="sc-code">kfn_find_vma(mm, addr)</div>
+    </div>
+    <div class="scenario-card">
+      <div class="sc-icon">📄</div>
+      <div class="sc-title">遍历页表</div>
+      <div class="sc-text">
+        通过 <code>mm.pgd</code> 字段找到页表根，然后
+        4 级遍历（PGD→PUD→PMD→PTE）找到目标地址的 PTE。
+      </div>
+      <div class="sc-code">mm + pgd_offset → *pte</div>
+    </div>
+    <div class="scenario-card">
+      <div class="sc-icon">🔄</div>
+      <div class="sc-title">切换物理页</div>
+      <div class="sc-text">
+        BRK 命中时，将 PTE 从影子页（含 BRK 指令）切换到原始页（正常代码），
+        单步执行完再切回去。
+      </div>
+      <div class="sc-code">*pte = make_pte(orig_pfn, flags)</div>
+    </div>
+    <div class="scenario-card">
+      <div class="sc-icon">💨</div>
+      <div class="sc-title">TLB 刷新（最后回退）</div>
+      <div class="sc-text">
+        修改 PTE 后必须刷新 TLB。优先用内核函数，实在没有时
+        用 ASID 精准刷新（<code>tlbi vale1is</code>）。
+      </div>
+      <div class="sc-code">tlbi vale1is, addr|(asid&lt;&lt;48)</div>
+    </div>
+  </div>
+
+  <h3>完整数据流</h3>
+  <div class="code-block">
+<span class="cm">// 1. 从当前 task 获取 mm（用 mm_offset）</span>
+<span class="ty">void</span> *mm = <span class="fn">kfn_get_task_mm</span>(current);
+
+<span class="cm">// 2. 用 pgd_offset 读页表根</span>
+<span class="ty">uint64_t</span> pgd = *(<span class="ty">uint64_t</span>*)(mm + pgd_offset);
+
+<span class="cm">// 3. 4级页表遍历找到 PTE</span>
+<span class="ty">uint64_t</span> *pte = <span class="fn">get_user_pte</span>(mm, target_addr);
+
+<span class="cm">// 4. 切换到影子页（BRK 指令在里面）</span>
+*pte = <span class="fn">make_pte</span>(shadow_pfn, <span class="num">0</span>);
+
+<span class="cm">// 5. 刷新 TLB（优先调用内核函数）</span>
+<span class="fn">flush_tlb_page</span>(vma, addr);
+<span class="cm">// 或回退: tlbi vale1is, addr | (asid &lt;&lt; 48)</span>
+  </div>
+
+  <div class="ok-box">
+    <strong>关键结论：</strong>
+    <code>mm_offset</code> 是整个 wxshadow 的基础，没有它就无法找到页表（pgd），
+    无法修改 PTE，无法切换影子页，无痕 hook 完全失效。
+    <code>context.id</code> 只是 TLB 刷新的最后兜底，优先级低得多。
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     ⑥ AOSP 源码位置
+════════════════════════════════════════════════════════ -->
+<div id="s6" class="section">
+  <h2>⑥ AOSP 源码文件位置</h2>
+
+  <table class="file-table">
+    <thead>
+      <tr>
+        <th>文件路径</th>
+        <th>类型</th>
+        <th>包含内容</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="path">include/linux/mm_types.h</td>
+        <td><span class="tag tag-core">核心</span></td>
+        <td class="desc"><code>mm_struct</code> 完整定义，包含所有字段</td>
+      </tr>
+      <tr>
+        <td class="path">arch/arm64/include/asm/mmu.h</td>
+        <td><span class="tag tag-arm64">ARM64</span></td>
+        <td class="desc"><code>mm_context_t</code> 定义（包含 <code>id</code> 字段）</td>
+      </tr>
+      <tr>
+        <td class="path">arch/arm64/mm/context.c</td>
+        <td><span class="tag tag-arm64">ARM64</span></td>
+        <td class="desc">ASID 分配、<code>check_and_switch_context()</code> 实现</td>
+      </tr>
+      <tr>
+        <td class="path">arch/arm64/mm/proc.S</td>
+        <td><span class="tag tag-arm64">ARM64</span></td>
+        <td class="desc"><code>cpu_do_switch_mm()</code>：写 TTBR0_EL1 的汇编实现</td>
+      </tr>
+      <tr>
+        <td class="path">include/linux/sched.h</td>
+        <td><span class="tag tag-core">核心</span></td>
+        <td class="desc"><code>task_struct</code> 定义，含 <code>mm</code>、<code>active_mm</code> 字段</td>
+      </tr>
+      <tr>
+        <td class="path">kernel/fork.c</td>
+        <td><span class="tag tag-core">核心</span></td>
+        <td class="desc"><code>copy_mm()</code>：fork 时复制 mm_struct</td>
+      </tr>
+      <tr>
+        <td class="path">arch/arm64/include/asm/mmu_context.h</td>
+        <td><span class="tag tag-arm64">ARM64</span></td>
+        <td class="desc">切换上下文宏定义，可看到 TTBR0 如何从 pgd+ASID 构建</td>
+      </tr>
+      <tr>
+        <td class="path">（MTK 厂商）arch/arm64/include/asm/mmu.h</td>
+        <td><span class="tag tag-mtk">MTK定制</span></td>
+        <td class="desc">MTK 修改了 <code>mm_context_t.id</code> 的语义，改为存完整 TTBR0 值</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>在线查看地址</h3>
+  <div class="info-box">
+    <strong>Android 公开内核（AOSP common kernel 5.10）：</strong><br>
+    <a href="https://android.googlesource.com/kernel/common/+/refs/heads/android12-5.10" 
+       style="color:#58a6ff" target="_blank">
+      android.googlesource.com/kernel/common (android12-5.10)
+    </a>
+    <br><br>
+    <strong>直接跳转到关键文件：</strong><br>
+    <code style="color:#a5d6ff">include/linux/mm_types.h</code> — 搜索 <code>struct mm_struct</code><br>
+    <code style="color:#a5d6ff">arch/arm64/include/asm/mmu.h</code> — 搜索 <code>mm_context_t</code><br><br>
+    <strong>MTK 内核（需要账号）：</strong><br>
+    联发科开发者门户 / Android Partner 内核仓库（非公开，通常需要 NDA）
+  </div>
+
+  <h3>快速定位结构体偏移的方法</h3>
+  <div class="code-block">
+<span class="cm"># 方法1：编译时通过 printk 打印</span>
+<span class="fn">pr_info</span>(<span class="str">"mm_offset in task_struct = %zu\n"</span>,
+         <span class="fn">offsetof</span>(<span class="kw">struct</span> <span class="ty">task_struct</span>, mm));
+
+<span class="cm"># 方法2：用 pahole/dwarfdump 分析带调试信息的 vmlinux</span>
+pahole -C task_struct vmlinux | grep -A2 "\bmm\b"
+
+<span class="cm"># 方法3：动态运行时扫描（wxshadow 的做法）</span>
+<span class="cm"># 在 init_task 内存中搜索 active_mm_offset，再推导 mm_offset = active_mm_offset - 8</span>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     扫描动画 JS
+════════════════════════════════════════════════════════ -->
+<script>
+function show(id, btn) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}
+
+// 模拟扫描动画
+const ASID = 0x0e18;
+const fakeRows = [
+  { off: '0x100', val: '0xFFFF80123456789A', note: 'kernel ptr — skip' },
+  { off: '0x108', val: '0x0000000000000000', note: 'NULL — skip' },
+  { off: '0x110', val: '0x0000000000000003', note: 'flags — skip' },
+  { off: '0x118', val: '0x0000000012345678', note: 'counter — skip' },
+  { off: '0x120', val: '0xFFFF800087654321', note: 'ptr — skip' },
+  { off: '0x128', val: '0x0000000000000000', note: 'NULL — skip' },
+  { off: '0x130', val: '0x00000005A3C20001', note: 'bits[16:31]=0x05A3 — skip' },
+  { off: '0x138', val: '0x0000000000100000', note: 'skip' },
+  { off: '0x140', val: '0xFFFFB000C000D001', note: 'bits[48:63]=0xFFFF — kernel ptr, skip' },
+  { off: '0x148', val: '0x0e1800012e50d001',
+    note: '✅ bits[48:63]=0x0e18 == ASID! 找到了！', match: true },
+];
+
+function buildScanRows() {
+  const container = document.getElementById('scan-rows');
+  container.innerHTML = '';
+  fakeRows.forEach((r, i) => {
+    const div = document.createElement('div');
+    div.className = 'scan-row';
+    div.id = 'row_' + i;
+    div.innerHTML = `<span class="s-off">${r.off}</span>
+                     <span class="s-val">0x${r.val}</span>
+                     <span class="s-note">—</span>`;
+    container.appendChild(div);
+  });
+}
+
+buildScanRows();
+
+async function runScan() {
+  const btn = document.getElementById('scan-btn');
+  btn.disabled = true;
+  buildScanRows();
+
+  for (let i = 0; i < fakeRows.length; i++) {
+    const row = document.getElementById('row_' + i);
+    row.classList.add('scanning');
+    await sleep(280);
+    row.classList.remove('scanning');
+
+    const noteEl = row.querySelector('.s-note');
+    if (fakeRows[i].match) {
+      row.classList.add('match');
+      noteEl.textContent = fakeRows[i].note;
+    } else {
+      noteEl.textContent = fakeRows[i].note;
+      noteEl.style.color = '#6e7681';
+    }
+    await sleep(60);
+  }
+  btn.disabled = false;
+  btn.textContent = '↺ 重新扫描';
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+</script>
+</body>
+</html>

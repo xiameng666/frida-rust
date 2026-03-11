@@ -87,7 +87,7 @@ push-zymbiote: zymbiote
     adb shell rm //sdcard/xiam-zymbiote
 
 # 一键编译 + 推送 + 启动 zymbiote
-zymbiote-deploy: push-zymbiote
+zymbiote-deploy: forward push-zymbiote
     adb shell su -c /data/local/tmp/xiam-zymbiote
 
 # 编译 ldmonitor
@@ -125,4 +125,5 @@ test-pwrite:
 
 # adb 端口转发
 forward:
+    adb shell su -c "setenforce 0"
     adb reverse tcp:12708 tcp:12708

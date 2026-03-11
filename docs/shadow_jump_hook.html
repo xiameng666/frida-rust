@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>影子页跳转 Hook — 执行 / 同页非Hook / CRC 三场景演示</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Cascadia Code','Consolas',monospace;background:#0d1117;color:#c9d1d9;overflow-x:hidden}
+
+.header{background:linear-gradient(135deg,#161b22,#1a2332);padding:18px 28px;border-bottom:1px solid #30363d}
+.header h1{font-size:18px;color:#58a6ff;margin-bottom:4px}
+.header p{font-size:12px;color:#8b949e}
+
+.tabs{display:flex;background:#161b22;border-bottom:1px solid #30363d}
+.tab{padding:11px 20px;cursor:pointer;color:#8b949e;font-size:13px;border-bottom:2px solid transparent;white-space:nowrap;transition:.2s}
+.tab:hover{color:#c9d1d9;background:#1c2333}
+.tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+
+.scene{display:none;padding:20px 28px;max-width:1260px}
+.scene.active{display:block}
+
+/* controls */
+.ctrl{display:flex;align-items:center;gap:10px;margin:12px 0;flex-wrap:wrap}
+.btn{padding:7px 16px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;cursor:pointer;font-size:12px;transition:.2s}
+.btn:hover{background:#30363d;border-color:#58a6ff}
+.btn.go{background:#238636;border-color:#2ea043}
+.btn.go:hover{background:#2ea043}
+.cnt{color:#8b949e;font-size:12px}
+
+.desc{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:13px 16px;margin:10px 0;min-height:52px;font-size:13px;line-height:1.7}
+.desc .L{color:#f0883e;font-weight:bold;margin-right:5px}
+.desc .E{color:#ff7b72}
+.desc .G{color:#3fb950}
+.desc .B{color:#58a6ff}
+.desc .W{color:#d29922}
+
+/* layout */
+.row{display:flex;gap:18px;margin-top:14px;flex-wrap:wrap}
+.col-mem{flex:1;min-width:340px}
+.col-reg{width:260px}
+
+.ptitle{font-size:12px;color:#58a6ff;margin-bottom:6px;font-weight:bold}
+
+.blk{background:#161b22;border:1px solid #30363d;border-radius:6px;margin-bottom:10px;overflow:hidden}
+.blk-h{background:#1c2333;padding:7px 11px;font-size:11px;color:#8b949e;display:flex;justify-content:space-between}
+.r{display:flex;padding:3px 11px;font-size:11px;border-top:1px solid #21262d;transition:.3s}
+.r.hi{background:#1f3a5f}
+.r.hr{background:#5f1f1f}
+.r.hg{background:#1f5f2f}
+.r.hy{background:#5f5f1f}
+.r.ho{background:#3d2f1f}
+.ra{color:#8b949e;width:82px;flex-shrink:0}
+.rv{color:#e6edf3;flex:1}
+.rc{color:#6e7681;font-style:italic;margin-left:8px;flex-shrink:0}
+
+.rblk{background:#161b22;border:1px solid #30363d;border-radius:6px;overflow:hidden;margin-bottom:10px}
+.rr{display:flex;justify-content:space-between;padding:3px 11px;font-size:11px;border-top:1px solid #21262d;transition:.3s}
+.rr:first-child{border:none}
+.rr.hi{background:#1f3a5f}
+.rn{color:#ff7b72;width:48px}
+.rv2{color:#e6edf3}
+
+/* state badge */
+.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:bold}
+.badge-x{background:#2d1f3f;color:#bc8cff}
+.badge-r{background:#1f3f2d;color:#7ee787}
+.badge-s{background:#3f2d1f;color:#f0883e}
+
+.note{background:#1c2333;border-left:3px solid #58a6ff;padding:10px 14px;margin:10px 0;font-size:12px;border-radius:0 5px 5px 0;line-height:1.6}
+.note.w{border-left-color:#d29922}
+.note.d{border-left-color:#ff7b72}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>跳转指令 + Execute-Only 影子页 — 三场景演示</h1>
+  <p>MOVZ/MOVK/BR 写入影子页(--x) | page_fault 状态机自动对抗 CRC | 零内核运行时开销</p>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="go(0)">① Hook 点执行</div>
+  <div class="tab" onclick="go(1)">② 同页非 Hook 点执行</div>
+  <div class="tab" onclick="go(2)">③ CRC 检测读取</div>
+  <div class="tab" onclick="go(3)">④ 三场景并发</div>
+</div>
+
+<!-- ============ SCENE 0: Hook point execution ============ -->
+<div class="scene active" id="sc0">
+  <div class="ctrl">
+    <button class="btn" onclick="prev(0)">◀ 上一步</button>
+    <button class="btn go" onclick="next(0)">下一步 ▶</button>
+    <button class="btn" onclick="rst(0)">↺ 重置</button>
+    <span class="cnt" id="c0">0 / 10</span>
+  </div>
+  <div class="desc" id="d0"><span class="L">场景 1</span>线程执行到 hook 点 (0x7200)。影子页含跳转指令，execute-only。</div>
+
+  <div class="row">
+    <div class="col-mem">
+      <div class="ptitle">📄 4KB 页面 (虚拟地址 0x7000-0x7FFF)</div>
+      <div class="blk">
+        <div class="blk-h"><span>影子页 (Shadow) — 当前 PTE 指向此页</span><span id="st0" class="badge badge-x">--x execute-only</span></div>
+        <div class="r" id="x0-0"><span class="ra">0x7000</span><span class="rv">ADD x0, x1, #4</span><span class="rc">非 hook 函数代码</span></div>
+        <div class="r" id="x0-1"><span class="ra">0x7004</span><span class="rv">RET</span><span class="rc"></span></div>
+        <div class="r" id="x0-2"><span class="ra">...</span><span class="rv">... (同页其他函数) ...</span><span class="rc"></span></div>
+        <div class="r" id="x0-3"><span class="ra">0x7200</span><span class="rv" id="v0-3" style="color:#ff7b72;font-weight:bold">MOVZ x16, #imm16</span><span class="rc">← hook 点: 跳转指令 [1/5]</span></div>
+        <div class="r" id="x0-4"><span class="ra">0x7204</span><span class="rv" style="color:#ff7b72">MOVK x16, #imm16, LSL#16</span><span class="rc">[2/5]</span></div>
+        <div class="r" id="x0-5"><span class="ra">0x7208</span><span class="rv" style="color:#ff7b72">MOVK x16, #imm16, LSL#32</span><span class="rc">[3/5]</span></div>
+        <div class="r" id="x0-6"><span class="ra">0x720C</span><span class="rv" style="color:#ff7b72">MOVK x16, #imm16, LSL#48</span><span class="rc">[4/5]</span></div>
+        <div class="r" id="x0-7"><span class="ra">0x7210</span><span class="rv" style="color:#ff7b72">BR x16</span><span class="rc">[5/5] 跳到 thunk</span></div>
+        <div class="r" id="x0-8"><span class="ra">0x7214</span><span class="rv">MOV x29, SP</span><span class="rc">原函数第 6 条（未被覆盖）</span></div>
+        <div class="r" id="x0-9"><span class="ra">...</span><span class="rv">... (原函数剩余代码) ...</span><span class="rc"></span></div>
+      </div>
+      <div class="blk">
+        <div class="blk-h"><span>原始页 (Original) — 备用，page_fault 时切换</span><span class="badge badge-r">r-- read-only</span></div>
+        <div class="r" id="o0-0"><span class="ra">0x7200</span><span class="rv">STP x29,x30,[SP,#-16]!</span><span class="rc">原始第1条 (未修改)</span></div>
+        <div class="r" id="o0-1"><span class="ra">0x7204</span><span class="rv">MOV x29, SP</span><span class="rc">原始第2条</span></div>
+      </div>
+      <div class="blk">
+        <div class="blk-h"><span>Thunk + Trampoline (RWX pool)</span></div>
+        <div class="r" id="k0-0"><span class="ra">thunk</span><span class="rv">SUB SP,#288; STP x0..x30; STR LR</span><span class="rc">保存上下文</span></div>
+        <div class="r" id="k0-1"><span class="ra">thunk+N</span><span class="rv">BLR onEnter</span><span class="rc">JS 回调</span></div>
+        <div class="r" id="k0-2"><span class="ra">thunk+N</span><span class="rv">LDP x0..x7; BLR trampoline</span><span class="rc">恢复参数, 调原函数</span></div>
+        <div class="r" id="k0-3"><span class="ra">thunk+N</span><span class="rv">STR x0; BLR onLeave</span><span class="rc">保存返回值, JS 回调</span></div>
+        <div class="r" id="k0-4"><span class="ra">thunk+N</span><span class="rv">LDR x0; LDR LR; ADD SP; RET</span><span class="rc">恢复, 返回调用者</span></div>
+        <div class="r" id="k0-5"><span class="ra">tramp</span><span class="rv">STP x29,x30,[SP,#-16]!</span><span class="rc">重定位的原始第1条</span></div>
+        <div class="r" id="k0-6"><span class="ra">tramp+4</span><span class="rv">B 0x7214</span><span class="rc">跳回第6条（跳过被覆盖的5条）</span></div>
+      </div>
+    </div>
+    <div class="col-reg">
+      <div class="ptitle">🔧 CPU</div>
+      <div class="rblk">
+        <div class="rr"><span class="rn">PC</span><span class="rv2" id="r0-pc">—</span></div>
+        <div class="rr"><span class="rn">LR</span><span class="rv2" id="r0-lr">—</span></div>
+        <div class="rr"><span class="rn">x0</span><span class="rv2" id="r0-x0">—</span></div>
+        <div class="rr"><span class="rn">EL</span><span class="rv2" id="r0-el">EL0</span></div>
+      </div>
+      <div class="ptitle">📋 PTE 状态</div>
+      <div class="rblk">
+        <div class="rr"><span class="rn">页面</span><span class="rv2" id="r0-page">影子页</span></div>
+        <div class="rr"><span class="rn">权限</span><span class="rv2" id="r0-perm">--x</span></div>
+        <div class="rr"><span class="rn">状态</span><span class="rv2" id="r0-st">SHADOW_X</span></div>
+      </div>
+      <div class="note" style="margin-top:12px">
+        <strong style="color:#3fb950">关键:</strong> 整个流程<br>不进内核，不触发异常。<br>CPU 直接执行影子页上的<br>跳转指令序列。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCENE 1: Same-page non-hook execution ============ -->
+<div class="scene" id="sc1">
+  <div class="ctrl">
+    <button class="btn" onclick="prev(1)">◀ 上一步</button>
+    <button class="btn go" onclick="next(1)">下一步 ▶</button>
+    <button class="btn" onclick="rst(1)">↺ 重置</button>
+    <span class="cnt" id="c1">0 / 4</span>
+  </div>
+  <div class="desc" id="d1"><span class="L">场景 2</span>另一个线程调用同页的另一个函数 (0x7000)，该函数<strong>不是</strong> hook 目标。</div>
+
+  <div class="row">
+    <div class="col-mem">
+      <div class="ptitle">📄 同一个 4KB 页面</div>
+      <div class="blk">
+        <div class="blk-h"><span>影子页 — PTE 指向此页</span><span id="st1" class="badge badge-x">--x execute-only</span></div>
+        <div class="r" id="x1-0"><span class="ra">0x7000</span><span class="rv">ADD x0, x1, #4</span><span class="rc">← 非 hook 函数入口</span></div>
+        <div class="r" id="x1-1"><span class="ra">0x7004</span><span class="rv">RET</span><span class="rc"></span></div>
+        <div class="r" id="x1-2"><span class="ra">...</span><span class="rv">...</span><span class="rc"></span></div>
+        <div class="r" id="x1-3"><span class="ra">0x7200</span><span class="rv" style="color:#ff7b72">MOVZ x16, #imm16</span><span class="rc">hook 点 (与此线程无关)</span></div>
+        <div class="r" id="x1-4"><span class="ra">0x7210</span><span class="rv" style="color:#ff7b72">BR x16</span><span class="rc"></span></div>
+      </div>
+    </div>
+    <div class="col-reg">
+      <div class="ptitle">🔧 CPU (线程 B)</div>
+      <div class="rblk">
+        <div class="rr"><span class="rn">PC</span><span class="rv2" id="r1-pc">—</span></div>
+        <div class="rr"><span class="rn">LR</span><span class="rv2" id="r1-lr">—</span></div>
+        <div class="rr"><span class="rn">x0</span><span class="rv2" id="r1-x0">—</span></div>
+      </div>
+      <div class="ptitle">📋 PTE 状态</div>
+      <div class="rblk">
+        <div class="rr"><span class="rn">权限</span><span class="rv2" id="r1-perm">--x</span></div>
+        <div class="rr"><span class="rn">状态</span><span class="rv2" id="r1-st">SHADOW_X</span></div>
+      </div>
+      <div class="note" style="margin-top:12px">
+        影子页上 hook 点以外的代码<br>和原始页<strong>完全一样</strong>。<br>非 hook 函数正常执行，<br>无任何影响。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCENE 2: CRC detection ============ -->
+<div class="scene" id="sc2">
+  <div class="ctrl">
+    <button class="btn" onclick="prev(2)">◀ 上一步</button>
+    <button class="btn go" onclick="next(2)">下一步 ▶</button>
+    <button class="btn" onclick="rst(2)">↺ 重置</button>
+    <span class="cnt" id="c2">0 / 7</span>
+  </div>
+  <div class="desc" id="d2"><span class="L">场景 3</span>CRC 检测线程执行 memcmp(0x7200, expected, 20)，尝试校验 hook 点的代码完整性。</div>
+
+  <div class="row">
+    <div class="col-mem">
+      <div class="ptitle">📄 4KB 页面 — W^X 状态机</div>
+      <div class="blk">
+        <div class="blk-h"><span>影子页 (Shadow)</span><span id="st2s" class="badge badge-x">--x execute-only</span></div>
+        <div class="r" id="x2-0"><span class="ra">0x7200</span><span class="rv" style="color:#ff7b72">MOVZ x16, #imm16</span><span class="rc">跳转指令 (CRC 看不到)</span></div>
+        <div class="r" id="x2-1"><span class="ra">0x7204</span><span class="rv" style="color:#ff7b72">MOVK x16, ...</span><span class="rc"></span></div>
+        <div class="r" id="x2-2"><span class="ra">0x7208</span><span class="rv" style="color:#ff7b72">MOVK x16, ...</span><span class="rc"></span></div>
+        <div class="r" id="x2-3"><span class="ra">0x720C</span><span class="rv" style="color:#ff7b72">MOVK x16, ...</span><span class="rc"></span></div>
+        <div class="r" id="x2-4"><span class="ra">0x7210</span><span class="rv" style="color:#ff7b72">BR x16</span><span class="rc"></span></div>
+      </div>
+      <div class="blk">
+        <div class="blk-h"><span>原始页 (Original)</span><span id="st2o" class="badge badge-r">r-- read-only</span></div>
+        <div class="r" id="o2-0"><span class="ra">0x7200</span><span class="rv">STP x29,x30,[SP,#-16]!</span><span class="rc">CRC 读到这个 ✓</span></div>
+        <div class="r" id="o2-1"><span class="ra">0x7204</span><span class="rv">MOV x29, SP</span><span class="rc">✓</span></div>
+        <div class="r" id="o2-2"><span class="ra">0x7208</span><span class="rv">SUB SP, SP, #0x40</span><span class="rc">✓</span></div>
+        <div class="r" id="o2-3"><span class="ra">0x720C</span><span class="rv">MOV x8, x0</span><span class="rc">✓</span></div>
+        <div class="r" id="o2-4"><span class="ra">0x7210</span><span class="rv">STR x1, [SP, #8]</span><span class="rc">✓</span></div>
+      </div>
+      <div class="blk">
+        <div class="blk-h"><span>CRC 检测代码 (另一个页面)</span></div>
+        <div class="r" id="crc-0"><span class="ra">check+0</span><span class="rv">LDR w2, [x0]</span><span class="rc">读 0x7200 处的 4 字节</span></div>
+        <div class="r" id="crc-1"><span class="ra">check+4</span><span class="rv">LDR w3, [x0, #4]</span><span class="rc">读 0x7204</span></div>
+        <div class="r" id="crc-2"><span class="ra">check+8</span><span class="rv">CMP w2, w4; CMP w3, w5</span><span class="rc">对比预期值</span></div>
+        <div class="r" id="crc-3"><span class="ra">check+C</span><span class="rv">B.NE detected</span><span class="rc">不匹配则报告</span></div>
+      </div>
+    </div>
+    <div class="col-reg">
+      <div class="ptitle">🔧 CRC 线程</div>
+      <div class="rblk">
+        <div class="rr"><span class="rn">PC</span><span class="rv2" id="r2-pc">—</span></div>
+        <div class="rr"><span class="rn">x0</span><span class="rv2" id="r2-x0">0x7200 (目标)</span></div>
+        <div class="rr"><span class="rn">w2</span><span class="rv2" id="r2-w2">—</span></div>
+        <div class="rr"><span class="rn">EL</span><span class="rv2" id="r2-el">EL0</span></div>
+      </div>
+      <div class="ptitle">📋 PTE 状态</div>
+      <div class="rblk">
+        <div class="rr"><span class="rn">指向</span><span class="rv2" id="r2-page">影子页</span></div>
+        <div class="rr"><span class="rn">权限</span><span class="rv2" id="r2-perm">--x</span></div>
+        <div class="rr"><span class="rn">状态</span><span class="rv2" id="r2-st">SHADOW_X</span></div>
+      </div>
+      <div class="ptitle" style="margin-top:10px">🛡️ 异常计数</div>
+      <div class="rblk">
+        <div class="rr"><span class="rn">Data Abort</span><span class="rv2" id="r2-da">0</span></div>
+        <div class="rr"><span class="rn">Insn Abort</span><span class="rv2" id="r2-ia">0</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCENE 3: Concurrent ============ -->
+<div class="scene" id="sc3">
+  <div class="desc" id="d3">
+    <span class="L">三线程并发运行</span> 展示 hook 执行、同页函数、CRC 检测同时发生时的行为。
+  </div>
+
+  <div class="row" style="gap:12px">
+    <div style="flex:1;min-width:230px">
+      <div class="blk">
+        <div class="blk-h"><span style="color:#ff7b72">线程 A: 调用 hook 函数</span></div>
+        <div class="r"><span class="rv" style="font-size:11px">
+          PC=0x7200 → 影子页取指<br>
+          → MOVZ/MOVK/BR → <span style="color:#3fb950">直接跳 thunk</span><br>
+          → onEnter → trampoline → 原函数<br>
+          → onLeave → 返回调用者<br><br>
+          <strong style="color:#ff7b72">异常次数: 0</strong><br>
+          <strong style="color:#3fb950">PTE 操作: 0</strong><br>
+          页面状态不变, 不影响其他线程
+        </span></div>
+      </div>
+    </div>
+    <div style="flex:1;min-width:230px">
+      <div class="blk">
+        <div class="blk-h"><span style="color:#58a6ff">线程 B: 调用同页非 hook 函数</span></div>
+        <div class="r"><span class="rv" style="font-size:11px">
+          PC=0x7000 → 影子页取指<br>
+          → ADD x0, x1, #4 (和原始页一样)<br>
+          → RET → <span style="color:#3fb950">正常返回</span><br><br>
+          <strong style="color:#58a6ff">异常次数: 0</strong><br>
+          <strong style="color:#3fb950">PTE 操作: 0</strong><br>
+          影子页非 hook 区域 = 原始页<br>
+          完全无感知
+        </span></div>
+      </div>
+    </div>
+    <div style="flex:1;min-width:230px">
+      <div class="blk">
+        <div class="blk-h"><span style="color:#d29922">线程 C: CRC 检测</span></div>
+        <div class="r"><span class="rv" style="font-size:11px">
+          LDR [0x7200] → <span style="color:#ff7b72">Data Abort</span><br>
+          → 内核: PTE 切到原始页(r--)<br>
+          → 重试 LDR → 读到<span style="color:#3fb950">原始字节 ✓</span><br>
+          → 后续 LDR 全部直接读成功<br>
+          → memcmp 完成, CRC <span style="color:#3fb950">通过 ✓</span><br><br>
+          <strong style="color:#d29922">异常次数: 1 (Data Abort)</strong><br>
+          <strong style="color:#d29922">PTE 操作: 1 (切到原始页)</strong>
+        </span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="blk" style="margin-top:14px">
+    <div class="blk-h"><span style="color:#f0883e">CRC 后的恢复</span></div>
+    <div class="r"><span class="rv" style="font-size:11px;line-height:1.8">
+      CRC 完成后页面处于 <span class="badge badge-r">r-- ORIG_R</span> 状态。下次有线程<strong>执行</strong>此页代码时:<br>
+      → <span style="color:#ff7b72">Instruction Abort</span> (r-- 不可执行)
+      → 内核: PTE 切回影子页(--x) → 状态恢复 <span class="badge badge-x">--x SHADOW_X</span><br>
+      → 线程 A 命中 hook → MOVZ/MOVK/BR → thunk (正常工作)<br>
+      → 线程 B 执行非 hook 函数 → 正常执行 (影子页和原始页内容相同)<br><br>
+      <strong style="color:#3fb950">整个过程: 线程 A 和 B 完全不知道 CRC 线程的存在。最多多一次 Instruction Abort 恢复开销。</strong>
+    </span></div>
+  </div>
+
+  <div class="note" style="margin-top:14px">
+    <strong>性能总结:</strong><br>
+    • Hook 执行: <strong style="color:#3fb950">0 次异常</strong> (纯用户态跳转)<br>
+    • 同页非 hook: <strong style="color:#3fb950">0 次异常</strong> (影子页内容相同)<br>
+    • CRC 检测: <strong style="color:#d29922">1 次 Data Abort</strong> (整页切换, 后续读无异常)<br>
+    • CRC 后恢复: <strong style="color:#d29922">1 次 Instruction Abort</strong> (下次执行时自动恢复)
+  </div>
+</div>
+
+<script>
+function go(i){
+  document.querySelectorAll('.tab').forEach((t,j)=>t.classList.toggle('active',j===i));
+  document.querySelectorAll('.scene').forEach((s,j)=>s.classList.toggle('active',j===i));
+}
+
+// Step data
+const S0 = [
+  {d:'<span class="L">Step 0: 初始状态</span>影子页 <span class="badge badge-x">--x</span> 已就绪。0x7200 处的 5 条原始指令已被 MOVZ/MOVK/BR 覆盖。其余代码和原始页完全一样。',
+   h:{x:[3,4,5,6,7]}, reg:{pc:'—',lr:'—',x0:'—',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 1: 调用者 BLR target</span>app 调用 android_dlopen_ext。<span class="B">PC = 0x7200</span>, x0 = 路径参数, LR = 调用者返回地址。',
+   h:{x:[3]}, reg:{pc:'<span style="color:#ff7b72">0x7200</span>',lr:'0x5000 (caller)',x0:'"/lib/libc.so"',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 2: CPU 取指</span>影子页是 <span class="B">execute-only (--x)</span>，指令取指 (instruction fetch) <span class="G">不受 AP 位限制</span>。CPU 成功取到 MOVZ x16 指令。<br><span class="G">无异常，无内核介入。</span>',
+   h:{x:[3]}, reg:{pc:'0x7200 → MOVZ',lr:'0x5000',x0:'"/lib/libc.so"',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 3: 执行跳转序列</span>连续执行 MOVZ → MOVK → MOVK → MOVK → BR x16。x16 现在 = thunk 地址。<br><span class="G">5 条指令，纯用户态，零开销。</span>',
+   h:{x:[3,4,5,6,7]}, reg:{pc:'<span style="color:#3fb950">thunk_addr</span>',lr:'0x5000',x0:'"/lib/libc.so"',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 4: Thunk — 保存上下文 + onEnter</span>保存 x0-x30, LR 到栈。调用 JS onEnter 回调。',
+   h:{k:[0,1]}, reg:{pc:'thunk (onEnter)',lr:'0x5000 (已存栈)',x0:'&HookContext',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 5: Thunk — BLR trampoline</span>恢复参数 → BLR trampoline。trampoline 执行重定位的原始第 1 条指令，然后 <span class="B">B 0x7214</span> 跳回原函数第 6 条。',
+   h:{k:[2,5,6]}, reg:{pc:'trampoline → 0x7214',lr:'thunk_continue',x0:'"/lib/libc.so"',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 6: 原函数执行</span>从 0x7214 开始正常执行。影子页上 0x7214+ 的指令和原始页<span class="G">完全一样</span>。',
+   h:{x:[8,9]}, reg:{pc:'0x7214+ (原函数体)',lr:'thunk_continue',x0:'...',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 7: 原函数返回 → Thunk</span>原函数 RET → 回到 thunk (因为 step 5 的 BLR 设了 LR)。Thunk 调 onLeave。',
+   h:{k:[3]}, reg:{pc:'thunk (onLeave)',lr:'thunk',x0:'<span style="color:#3fb950">handle</span>',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 8: 返回调用者</span>恢复 x0 (返回值) + LR (0x5000) → RET → <span class="G">回到调用者</span>。',
+   h:{k:[4]}, reg:{pc:'<span style="color:#3fb950">0x5000 (caller)</span>',lr:'—',x0:'handle',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 9: 总结</span>整个 hook 流程: <span class="G">0 次异常, 0 次内核进出, 0 次 PTE 切换</span>。<br>和没有内核模块时的普通 inline hook 一样快，但原始页完全未被修改，/proc/self/maps 无痕迹。',
+   h:{}, reg:{pc:'—',lr:'—',x0:'—',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X'}},
+];
+
+const S1 = [
+  {d:'<span class="L">Step 0: 线程 B 调用 0x7000</span>同页的另一个函数，不是 hook 目标。PC = 0x7000。',
+   h:{x:[0]}, reg:{pc:'<span style="color:#58a6ff">0x7000</span>',lr:'0x6000',x0:'42',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 1: CPU 取指成功</span>影子页 --x 允许取指。0x7000 处的代码和原始页<span class="G">完全一样</span>（只有 0x7200-0x7213 被覆盖）。<br>CPU 取到 ADD x0, x1, #4。',
+   h:{x:[0]}, reg:{pc:'0x7000 → ADD',lr:'0x6000',x0:'42',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 2: 正常执行 + 返回</span>ADD x0, x1, #4 → RET。<span class="G">完全正常，无异常，无感知。</span>',
+   h:{x:[0,1]}, reg:{pc:'<span style="color:#3fb950">0x6000 (caller)</span>',lr:'—',x0:'46',perm:'--x',st:'SHADOW_X'}},
+  {d:'<span class="L">Step 3: 总结</span>同页非 hook 函数: <span class="G">零开销，零异常</span>。影子页上只有 hook 点的 20 字节不同，其余完全是原始页的复制品。',
+   h:{}, reg:{pc:'—',lr:'—',x0:'—',perm:'--x',st:'SHADOW_X'}},
+];
+
+const S2 = [
+  {d:'<span class="L">Step 0: CRC 线程开始检测</span>检测代码: memcmp(0x7200, expected_prologue, 20)。即将执行第一个 LDR [0x7200]。',
+   h:{crc:[0]}, reg:{pc:'check+0',x0:'0x7200',w2:'—',el:'EL0',page:'影子页',perm:'--x',st:'SHADOW_X',da:'0',ia:'0'}},
+  {d:'<span class="L">Step 1: LDR 触发 Data Abort</span>影子页是 <span class="E">execute-only (--x)</span>，数据读取被禁止。CPU 产生 <span class="E">Data Abort (ESR: 读异常)</span>，陷入 EL1。',
+   h:{crc:[0],x:[0]}, reg:{pc:'<span style="color:#ff7b72">EL1 page_fault</span>',x0:'0x7200',w2:'—',el:'<span style="color:#ff7b72">EL1</span>',page:'影子页',perm:'--x',st:'SHADOW_X',da:'<span style="color:#ff7b72">1</span>',ia:'0'}},
+  {d:'<span class="L">Step 2: page_fault handler 处理</span>内核识别地址在 wxshadow region 内, WnR=0 (读)。<br>→ 调 <span class="B">wxshadow_handle_read_fault</span> → 切 PTE 到原始页(r--) → 状态变 <span class="badge badge-r">ORIG_R</span>。<br>返回用户态, CPU <span class="G">自动重试</span> LDR 指令。',
+   h:{o:[0,1,2,3,4]}, reg:{pc:'check+0 (重试)',x0:'0x7200',w2:'—',el:'EL0',page:'<span style="color:#3fb950">原始页</span>',perm:'<span style="color:#3fb950">r--</span>',st:'<span style="color:#3fb950">ORIG_R</span>',da:'1',ia:'0'}},
+  {d:'<span class="L">Step 3: LDR 成功 — 读到原始字节</span>页面现在是 r-- 可读。LDR [0x7200] → 读到 <span class="G">STP x29,x30,[SP,#-16]!</span> 的机器码。<br>这是<span class="G">原始未修改的指令</span>，和 CRC 预期值匹配。',
+   h:{o:[0],crc:[0]}, reg:{pc:'check+4',x0:'0x7200',w2:'<span style="color:#3fb950">0xA9BF7BFD (STP)</span>',el:'EL0',page:'原始页',perm:'r--',st:'ORIG_R',da:'1',ia:'0'}},
+  {d:'<span class="L">Step 4: 后续 LDR 全部直接成功</span>页面仍然是 r-- 可读。LDR [0x7204], [0x7208], [0x720C], [0x7210] 全部<span class="G">无异常</span>直接读到原始字节。<br><span class="W">整页只触发了 1 次 Data Abort。</span>',
+   h:{o:[0,1,2,3,4],crc:[1]}, reg:{pc:'check+8',x0:'0x7200',w2:'all original ✓',el:'EL0',page:'原始页',perm:'r--',st:'ORIG_R',da:'1',ia:'0'}},
+  {d:'<span class="L">Step 5: CRC 校验通过</span>CMP 比较全部匹配 → B.NE 不跳转 → <span class="G">CRC 检测通过 ✓</span><br>CRC 线程认为代码完整性正常，函数序言未被修改。',
+   h:{crc:[2,3]}, reg:{pc:'check 返回',x0:'0x7200',w2:'match ✓',el:'EL0',page:'原始页',perm:'r--',st:'ORIG_R',da:'1',ia:'0'}},
+  {d:'<span class="L">Step 6: 页面自动恢复</span>下次有线程<strong>执行</strong>此页代码 → <span class="E">Instruction Abort</span> (r-- 不可执行) → 内核切回影子页(--x) → <span class="badge badge-x">SHADOW_X</span><br><br><span class="G">自动恢复，无需任何额外代码。hook 继续正常工作。</span><br><br>异常总计: <span class="W">1 Data Abort + 1 Instruction Abort = 2 次异常</span>',
+   h:{}, reg:{pc:'—',x0:'—',w2:'—',el:'EL0',page:'<span style="color:#bc8cff">影子页</span>',perm:'<span style="color:#bc8cff">--x</span>',st:'<span style="color:#bc8cff">SHADOW_X</span>',da:'1',ia:'<span style="color:#d29922">1</span>'}},
+];
+
+const SS = [S0,S1,S2];
+const IDX = [0,0,0];
+
+function hl(sc, h) {
+  document.querySelectorAll(`#sc${sc} .r`).forEach(r=>r.className='r');
+  if(!h) return;
+  (h.x||[]).forEach(i=>{let e=document.getElementById(`x${sc}-${i}`);if(e)e.classList.add('hi')});
+  (h.o||[]).forEach(i=>{let e=document.getElementById(`o${sc}-${i}`);if(e)e.classList.add('hg')});
+  (h.k||[]).forEach(i=>{let e=document.getElementById(`k${sc}-${i}`);if(e)e.classList.add('hy')});
+  (h.crc||[]).forEach(i=>{let e=document.getElementById(`crc-${i}`);if(e)e.classList.add('ho')});
+}
+
+function apply(sc) {
+  let s = SS[sc][IDX[sc]];
+  document.getElementById(`d${sc}`).innerHTML = s.d;
+  document.getElementById(`c${sc}`).textContent = `${IDX[sc]} / ${SS[sc].length-1}`;
+  hl(sc, s.h);
+  if(s.reg) Object.entries(s.reg).forEach(([k,v])=>{
+    let e=document.getElementById(`r${sc}-${k}`);
+    if(e)e.innerHTML=v;
+  });
+}
+
+function next(sc){if(IDX[sc]<SS[sc].length-1){IDX[sc]++;apply(sc)}}
+function prev(sc){if(IDX[sc]>0){IDX[sc]--;apply(sc)}}
+function rst(sc){
+  IDX[sc]=0;
+  document.getElementById(`d${sc}`).innerHTML=SS[sc][0]?SS[sc][0].d:'';
+  document.getElementById(`c${sc}`).textContent=`0 / ${SS[sc].length-1}`;
+  hl(sc,SS[sc][0]?SS[sc][0].h:null);
+  if(SS[sc][0]&&SS[sc][0].reg) Object.entries(SS[sc][0].reg).forEach(([k,v])=>{
+    let e=document.getElementById(`r${sc}-${k}`);if(e)e.innerHTML=v;
+  });
+}
+
+document.addEventListener('keydown',e=>{
+  let sc=[...document.querySelectorAll('.scene')].findIndex(s=>s.classList.contains('active'));
+  if(sc<0||sc>2)return;
+  if(e.key==='ArrowRight'||e.key===' '){e.preventDefault();next(sc)}
+  if(e.key==='ArrowLeft'){e.preventDefault();prev(sc)}
+  if(e.key==='r')rst(sc);
+});
+
+// Init
+rst(0);rst(1);rst(2);
+</script>
+</body>
+</html>

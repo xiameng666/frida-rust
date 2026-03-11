@@ -4,7 +4,7 @@ use crate::context::JSContext;
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::value::JSValue;
-use crate::jsapi::ptr::get_native_pointer_addr;
+use crate::jsapi::ptr::{get_native_pointer_addr, create_native_pointer};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -38,7 +38,8 @@ fn hook_error_message(code: i32) -> &'static [u8] {
 /// Stored hook callback data - stores raw bytes to avoid Send/Sync issues
 struct HookData {
     ctx: usize,  // Store as usize to avoid Send/Sync issues
-    callback_bytes: [u8; 16],  // JSValue is 16 bytes (u64 + i64)
+    on_enter_bytes: [u8; 16],  // JSValue is 16 bytes (u64 + i64)
+    on_leave_bytes: Option<[u8; 16]>,  // Optional on_leave callback
 }
 
 // SAFETY: HookData only contains Copy types now (usize, [u8; 16])
@@ -82,7 +83,7 @@ unsafe extern "C" fn hook_callback_wrapper(
 
     let ctx = hook_data.ctx as *mut ffi::JSContext;
     // Reconstruct JSValue from bytes
-    let callback: ffi::JSValue = std::ptr::read(hook_data.callback_bytes.as_ptr() as *const ffi::JSValue);
+    let callback: ffi::JSValue = std::ptr::read(hook_data.on_enter_bytes.as_ptr() as *const ffi::JSValue);
 
     // Create context object for JS callback
     let js_ctx = ffi::JS_NewObject(ctx);
@@ -90,13 +91,13 @@ unsafe extern "C" fn hook_callback_wrapper(
     // Populate context with register values
     let hook_ctx = &*ctx_ptr;
 
-    // Add x0-x30
+    // Add x0-x30 as NativePointer (BigUint64 cannot be implicitly converted in non-math-mode)
     for i in 0..31 {
         let prop_name = format!("x{}", i);
         let cprop = CString::new(prop_name).unwrap();
         let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
-        let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[i]);
-        ffi::qjs_set_property(ctx, js_ctx, atom, val);
+        let np = create_native_pointer(ctx, hook_ctx.x[i]);
+        ffi::qjs_set_property(ctx, js_ctx, atom, np.raw());
         ffi::JS_FreeAtom(ctx, atom);
     }
 
@@ -104,8 +105,8 @@ unsafe extern "C" fn hook_callback_wrapper(
     {
         let cprop = CString::new("sp").unwrap();
         let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
-        let val = ffi::JS_NewBigUint64(ctx, hook_ctx.sp);
-        ffi::qjs_set_property(ctx, js_ctx, atom, val);
+        let np = create_native_pointer(ctx, hook_ctx.sp);
+        ffi::qjs_set_property(ctx, js_ctx, atom, np.raw());
         ffi::JS_FreeAtom(ctx, atom);
     }
 
@@ -113,8 +114,8 @@ unsafe extern "C" fn hook_callback_wrapper(
     {
         let cprop = CString::new("pc").unwrap();
         let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
-        let val = ffi::JS_NewBigUint64(ctx, hook_ctx.pc);
-        ffi::qjs_set_property(ctx, js_ctx, atom, val);
+        let np = create_native_pointer(ctx, hook_ctx.pc);
+        ffi::qjs_set_property(ctx, js_ctx, atom, np.raw());
         ffi::JS_FreeAtom(ctx, atom);
     }
 
@@ -122,8 +123,7 @@ unsafe extern "C" fn hook_callback_wrapper(
     let global = ffi::JS_GetGlobalObject(ctx);
     let result = ffi::JS_Call(ctx, callback, global, 1, &js_ctx as *const _ as *mut _);
 
-    // Check if callback modified any registers
-    // Read back x0-x7 (commonly modified)
+    // Read back x0-x7: support both NativePointer and numeric values
     for i in 0..8 {
         let prop_name = format!("x{}", i);
         let cprop = CString::new(prop_name).unwrap();
@@ -132,7 +132,9 @@ unsafe extern "C" fn hook_callback_wrapper(
         ffi::JS_FreeAtom(ctx, atom);
 
         let js_val = JSValue(val);
-        if let Some(new_val) = js_val.to_u64(ctx) {
+        if let Some(addr) = get_native_pointer_addr(ctx, js_val) {
+            (*ctx_ptr).x[i] = addr;
+        } else if let Some(new_val) = js_val.to_u64(ctx) {
             (*ctx_ptr).x[i] = new_val;
         }
         js_val.free(ctx);
@@ -144,8 +146,87 @@ unsafe extern "C" fn hook_callback_wrapper(
     ffi::qjs_free_value(ctx, global);
 }
 
-/// hook(ptr, callback, stealth?) - Install a hook at the given address
-/// stealth: optional boolean, default false. If true, uses wxshadow for traceless hooking.
+/// on_leave callback wrapper - called when hooked function returns
+unsafe extern "C" fn hook_leave_callback_wrapper(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    user_data: *mut std::ffi::c_void,
+) {
+    if ctx_ptr.is_null() || user_data.is_null() {
+        return;
+    }
+
+    let target_addr = user_data as u64;
+
+    let guard = HOOK_REGISTRY.lock().unwrap();
+    let registry = match guard.as_ref() {
+        Some(r) => r,
+        None => return,
+    };
+
+    let hook_data = match registry.get(&target_addr) {
+        Some(d) => d,
+        None => return,
+    };
+
+    let on_leave_bytes = match &hook_data.on_leave_bytes {
+        Some(b) => b,
+        None => return,
+    };
+
+    let ctx = hook_data.ctx as *mut ffi::JSContext;
+    let callback: ffi::JSValue = std::ptr::read(on_leave_bytes.as_ptr() as *const ffi::JSValue);
+
+    // Create context object with return value (x0) and other regs
+    let js_ctx = ffi::JS_NewObject(ctx);
+    let hook_ctx = &*ctx_ptr;
+
+    // Add x0 as "retval" (NativePointer)
+    {
+        let cprop = CString::new("retval").unwrap();
+        let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
+        let np = create_native_pointer(ctx, hook_ctx.x[0]);
+        ffi::qjs_set_property(ctx, js_ctx, atom, np.raw());
+        ffi::JS_FreeAtom(ctx, atom);
+    }
+
+    // Also add x0-x7 as NativePointer
+    for i in 0..8 {
+        let prop_name = format!("x{}", i);
+        let cprop = CString::new(prop_name).unwrap();
+        let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
+        let np = create_native_pointer(ctx, hook_ctx.x[i]);
+        ffi::qjs_set_property(ctx, js_ctx, atom, np.raw());
+        ffi::JS_FreeAtom(ctx, atom);
+    }
+
+    // Call the JS callback
+    let global = ffi::JS_GetGlobalObject(ctx);
+    let result = ffi::JS_Call(ctx, callback, global, 1, &js_ctx as *const _ as *mut _);
+
+    // Read back retval: support both NativePointer and numeric values
+    {
+        let cprop = CString::new("retval").unwrap();
+        let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
+        let val = ffi::qjs_get_property(ctx, js_ctx, atom);
+        ffi::JS_FreeAtom(ctx, atom);
+
+        let js_val = JSValue(val);
+        if let Some(addr) = get_native_pointer_addr(ctx, js_val) {
+            (*ctx_ptr).x[0] = addr;
+        } else if let Some(new_val) = js_val.to_u64(ctx) {
+            (*ctx_ptr).x[0] = new_val;
+        }
+        js_val.free(ctx);
+    }
+
+    ffi::qjs_free_value(ctx, js_ctx);
+    ffi::qjs_free_value(ctx, result);
+    ffi::qjs_free_value(ctx, global);
+}
+
+/// hook(ptr, onEnter, onLeave?, stealth?) - Install a hook at the given address
+/// If 3rd arg is boolean, it's treated as stealth (backward compatible).
+/// If 3rd arg is function, it's onLeave; 4th arg is stealth.
 unsafe extern "C" fn js_hook(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -159,12 +240,24 @@ unsafe extern "C" fn js_hook(
     let ptr_arg = JSValue(*argv);
     let callback_arg = JSValue(*argv.add(1));
 
-    // Get optional stealth flag (3rd argument, default false)
-    let stealth = if argc >= 3 {
-        let stealth_arg = JSValue(*argv.add(2));
-        stealth_arg.to_bool().unwrap_or(false)
+    // Parse 3rd arg: if function → onLeave; if bool → stealth
+    let (on_leave_arg, stealth) = if argc >= 3 {
+        let arg3 = JSValue(*argv.add(2));
+        if arg3.is_function(ctx) {
+            // hook(addr, onEnter, onLeave, stealth?)
+            let stealth = if argc >= 4 {
+                let arg4 = JSValue(*argv.add(3));
+                arg4.to_bool().unwrap_or(false)
+            } else {
+                false
+            };
+            (Some(arg3), stealth)
+        } else {
+            // hook(addr, onEnter, stealth) — backward compatible
+            (None, arg3.to_bool().unwrap_or(false))
+        }
     } else {
-        false
+        (None, false)
     };
 
     // Get the address
@@ -187,23 +280,39 @@ unsafe extern "C" fn js_hook(
     // Initialize registry
     init_registry();
 
-    // Duplicate the callback to prevent GC
-    let callback_dup = ffi::qjs_dup_value(ctx, callback_arg.raw());
+    // Duplicate the on_enter callback to prevent GC
+    let enter_dup = ffi::qjs_dup_value(ctx, callback_arg.raw());
 
-    // Store in registry - convert to bytes for Send/Sync safety
-    let mut callback_bytes = [0u8; 16];
+    let mut on_enter_bytes = [0u8; 16];
     std::ptr::copy_nonoverlapping(
-        &callback_dup as *const ffi::JSValue as *const u8,
-        callback_bytes.as_mut_ptr(),
+        &enter_dup as *const ffi::JSValue as *const u8,
+        on_enter_bytes.as_mut_ptr(),
         16
     );
+
+    // Duplicate on_leave callback if provided
+    let on_leave_bytes = if let Some(leave_arg) = on_leave_arg {
+        let leave_dup = ffi::qjs_dup_value(ctx, leave_arg.raw());
+        let mut bytes = [0u8; 16];
+        std::ptr::copy_nonoverlapping(
+            &leave_dup as *const ffi::JSValue as *const u8,
+            bytes.as_mut_ptr(),
+            16
+        );
+        Some(bytes)
+    } else {
+        None
+    };
+
+    let has_on_leave = on_leave_bytes.is_some();
 
     {
         let mut guard = HOOK_REGISTRY.lock().unwrap();
         let registry = guard.as_mut().unwrap();
         registry.insert(addr, HookData {
             ctx: ctx as usize,
-            callback_bytes,
+            on_enter_bytes,
+            on_leave_bytes,
         });
     }
 
@@ -211,8 +320,8 @@ unsafe extern "C" fn js_hook(
     let result = hook_ffi::hook_attach(
         addr as *mut std::ffi::c_void,
         Some(hook_callback_wrapper),
-        None, // No on_leave callback for now
-        addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
+        if has_on_leave { Some(hook_leave_callback_wrapper) } else { None },
+        addr as *mut std::ffi::c_void,
         if stealth { 1 } else { 0 },
     );
 
@@ -221,8 +330,12 @@ unsafe extern "C" fn js_hook(
         let mut guard = HOOK_REGISTRY.lock().unwrap();
         if let Some(registry) = guard.as_mut() {
             if let Some(data) = registry.remove(&addr) {
-                let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, callback);
+                let enter_cb: ffi::JSValue = std::ptr::read(data.on_enter_bytes.as_ptr() as *const ffi::JSValue);
+                ffi::qjs_free_value(ctx, enter_cb);
+                if let Some(leave_bytes) = &data.on_leave_bytes {
+                    let leave_cb: ffi::JSValue = std::ptr::read(leave_bytes.as_ptr() as *const ffi::JSValue);
+                    ffi::qjs_free_value(ctx, leave_cb);
+                }
             }
         }
         let err_msg = hook_error_message(result);
@@ -262,8 +375,12 @@ unsafe extern "C" fn js_unhook(
         if let Some(registry) = guard.as_mut() {
             if let Some(data) = registry.remove(&addr) {
                 let ctx = data.ctx as *mut ffi::JSContext;
-                let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, callback);
+                let enter_cb: ffi::JSValue = std::ptr::read(data.on_enter_bytes.as_ptr() as *const ffi::JSValue);
+                ffi::qjs_free_value(ctx, enter_cb);
+                if let Some(leave_bytes) = &data.on_leave_bytes {
+                    let leave_cb: ffi::JSValue = std::ptr::read(leave_bytes.as_ptr() as *const ffi::JSValue);
+                    ffi::qjs_free_value(ctx, leave_cb);
+                }
             }
         }
     }
@@ -284,9 +401,9 @@ pub fn register_hook_api(ctx: &JSContext) {
     let global = ctx.global_object();
 
     unsafe {
-        // Register hook(ptr, callback, stealth?)
+        // Register hook(ptr, onEnter, onLeave?, stealth?)
         let cname = CString::new("hook").unwrap();
-        let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_hook), cname.as_ptr(), 3);
+        let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_hook), cname.as_ptr(), 4);
         global.set_property(ctx.as_ptr(), "hook", JSValue(func_val));
 
         // Register unhook()
@@ -306,8 +423,12 @@ pub fn cleanup_hooks() {
             unsafe {
                 hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
                 let ctx = data.ctx as *mut ffi::JSContext;
-                let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, callback);
+                let enter_cb: ffi::JSValue = std::ptr::read(data.on_enter_bytes.as_ptr() as *const ffi::JSValue);
+                ffi::qjs_free_value(ctx, enter_cb);
+                if let Some(leave_bytes) = &data.on_leave_bytes {
+                    let leave_cb: ffi::JSValue = std::ptr::read(leave_bytes.as_ptr() as *const ffi::JSValue);
+                    ffi::qjs_free_value(ctx, leave_cb);
+                }
             }
         }
     }
